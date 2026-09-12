@@ -1,0 +1,258 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import logging
+import os
+import socket
+import subprocess
+import tempfile
+import time
+from typing import Any, Dict, Optional, Tuple
+import requests
+
+from config import (
+    FAST_TCP_PRECHECK,
+    MAX_FAIL_COUNT,
+    SING_BOX_PATH,
+    SPEED_TEST_URL,
+    TCP_PING_TIMEOUT,
+    TEST_TIMEOUT,
+    TEST_URL,
+)
+from database import Database
+from parser import parse_node_url
+
+logger = logging.getLogger("tester")
+
+def check_tcp_reachable(host: str, port: int, timeout: float = TCP_PING_TIMEOUT) -> bool:
+    """Fast pre-flight TCP handshake check to weed out dead hosts without spawning sing-box."""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def get_free_port() -> int:
+    """Find a free local TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+
+def build_singbox_test_config(outbound_cfg: Dict[str, Any], port: int) -> Dict[str, Any]:
+    """Assemble an isolated sing-box config for testing."""
+    return {
+        "log": {"level": "warn"},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": port,
+            }
+        ],
+        "outbounds": [
+            outbound_cfg,
+            {"type": "direct", "tag": "direct"},
+        ],
+    }
+
+
+def probe_node_delay(port: int, timeout: float = TEST_TIMEOUT) -> Optional[int]:
+    """
+    Send an HTTP probe request via local proxy port to test latency.
+    Returns delay in milliseconds, or None on failure.
+    """
+    proxies = {
+        "http": f"http://127.0.0.1:{port}",
+        "https": f"http://127.0.0.1:{port}",
+    }
+    start = time.perf_counter()
+    try:
+        resp = requests.get(
+            TEST_URL,
+            proxies=proxies,
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        if resp.status_code in (200, 204):
+            return max(1, elapsed_ms)
+    except Exception as e:
+        logger.debug(f"Probe failed via port {port}: {e}")
+    return None
+
+
+def probe_download_speed(port: int, sample_duration: float = 2.5) -> float:
+    """
+    Measure download speed (Mbps) via the proxy port.
+    Returns 0.0 if failed.
+    """
+    proxies = {
+        "http": f"http://127.0.0.1:{port}",
+        "https": f"http://127.0.0.1:{port}",
+    }
+    try:
+        start = time.perf_counter()
+        resp = requests.get(
+            SPEED_TEST_URL,
+            proxies=proxies,
+            stream=True,
+            timeout=sample_duration + 1.0,
+        )
+        if resp.status_code != 200:
+            return 0.0
+
+        downloaded_bytes = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            downloaded_bytes += len(chunk)
+            if time.perf_counter() - start >= sample_duration:
+                break
+
+        elapsed = time.perf_counter() - start
+        if elapsed > 0:
+            # bytes to bits -> Mbps
+            speed_mbps = round((downloaded_bytes * 8) / (elapsed * 1000 * 1000), 2)
+            return speed_mbps
+    except Exception as e:
+        logger.debug(f"Speed test failed via port {port}: {e}")
+    return 0.0
+
+
+def test_single_node(
+    node: Dict[str, Any], enable_speed_test: bool = True
+) -> Tuple[int, str, int, float, int]:
+    """
+    Execute an isolated sing-box test for a single node.
+    Returns (node_id, new_status, delay_ms, speed_mbps, fail_count)
+    """
+    node_id = node["id"]
+    node_url = node["node_url"]
+    current_fail = node.get("fail_count", 0)
+
+    outbound_cfg = parse_node_url(node_url, tag="proxy")
+    if not outbound_cfg:
+        logger.warning(f"Node {node_id} could not be parsed into sing-box config")
+        return node_id, "dead", -1, 0.0, MAX_FAIL_COUNT
+
+    server = outbound_cfg.get("server")
+    server_port = outbound_cfg.get("server_port")
+    proto_type = outbound_cfg.get("type", "")
+
+    # Fast pre-flight TCP connectivity check (for TCP-based protocols)
+    if FAST_TCP_PRECHECK and proto_type not in ("hysteria2", "tuic") and server and server_port:
+        if not check_tcp_reachable(server, server_port, timeout=TCP_PING_TIMEOUT):
+            new_fail = current_fail + 1
+            new_status = "dead" if new_fail >= MAX_FAIL_COUNT else "untested"
+            logger.info(
+                f"Node {node_id} [TCP UNREACHABLE] {server}:{server_port} | fail_count: {new_fail}/{MAX_FAIL_COUNT} -> {new_status}"
+            )
+            return node_id, new_status, -1, 0.0, new_fail
+
+    port = get_free_port()
+    config_dict = build_singbox_test_config(outbound_cfg, port)
+
+
+    temp_cfg = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    proc: Optional[subprocess.Popen] = None
+
+    try:
+        json.dump(config_dict, temp_cfg)
+        temp_cfg.close()
+
+        # Launch sing-box in background
+        proc = subprocess.Popen(
+            [SING_BOX_PATH, "run", "-c", temp_cfg.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Allow sing-box to initialize listener
+        time.sleep(0.3)
+
+        if proc.poll() is not None:
+            # Process died prematurely
+            logger.warning(f"sing-box failed to start for node {node_id}")
+            new_fail = current_fail + 1
+            new_status = "dead" if new_fail >= MAX_FAIL_COUNT else "untested"
+            return node_id, new_status, -1, 0.0, new_fail
+
+        delay_ms = probe_node_delay(port)
+        if delay_ms is not None:
+            speed_mbps = 0.0
+            if enable_speed_test and delay_ms < 1500:
+                speed_mbps = probe_download_speed(port)
+            logger.info(
+                f"Node {node_id} [ACTIVE] | Delay: {delay_ms}ms | Speed: {speed_mbps}Mbps"
+            )
+            return node_id, "active", delay_ms, speed_mbps, 0
+        else:
+            new_fail = current_fail + 1
+            new_status = "dead" if new_fail >= MAX_FAIL_COUNT else "untested"
+            logger.info(
+                f"Node {node_id} [FAILED] | fail_count: {new_fail}/{MAX_FAIL_COUNT} -> {new_status}"
+            )
+            return node_id, new_status, -1, 0.0, new_fail
+
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if os.path.exists(temp_cfg.name):
+            try:
+                os.remove(temp_cfg.name)
+            except Exception:
+                pass
+
+
+class NodeTester:
+    """Batch tester coordinating sing-box testing with concurrency."""
+
+    def __init__(self, db: Database, concurrency: int = 5):
+        self.db = db
+        self.concurrency = concurrency
+
+    def run(self, limit: int = 50, enable_speed_test: bool = True) -> Dict[str, int]:
+        """
+        Run test cycle on candidate nodes from the database.
+        Returns statistics: {'tested': count, 'active': count, 'dead': count}
+        """
+        nodes = self.db.get_nodes_for_testing(limit=limit)
+        if not nodes:
+            logger.info("No nodes available for testing.")
+            return {"tested": 0, "active": 0, "dead": 0}
+
+        logger.info(f"Starting test on {len(nodes)} nodes with concurrency={self.concurrency}")
+        stats = {"tested": 0, "active": 0, "dead": 0}
+
+        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            futures = {
+                executor.submit(test_single_node, node, enable_speed_test): node
+                for node in nodes
+            }
+
+            for future in as_completed(futures):
+                try:
+                    node_id, status, delay_ms, speed_mbps, fail_count = future.result()
+                    self.db.update_test_result(
+                        node_id=node_id,
+                        status=status,
+                        delay_ms=delay_ms,
+                        speed_mbps=speed_mbps,
+                        fail_count=fail_count,
+                    )
+                    stats["tested"] += 1
+                    if status == "active":
+                        stats["active"] += 1
+                    elif status == "dead":
+                        stats["dead"] += 1
+                except Exception as e:
+                    logger.error(f"Error executing test task: {e}")
+
+        logger.info(f"Testing finished. Stats: {stats}")
+        return stats
