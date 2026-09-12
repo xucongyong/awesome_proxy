@@ -356,6 +356,18 @@ class D1Database(Database):
         CREATE INDEX IF NOT EXISTS idx_nodes_active ON nodes(is_active);
         """
         self._execute(sql)
+        for col_def in [
+            ("cn_delay_ms", "INTEGER DEFAULT -1"),
+            ("cn_is_active", "INTEGER DEFAULT NULL"),
+            ("cn_last_tested", "TIMESTAMP"),
+            ("global_delay_ms", "INTEGER DEFAULT -1"),
+            ("global_is_active", "INTEGER DEFAULT NULL"),
+            ("global_last_tested", "TIMESTAMP"),
+        ]:
+            try:
+                self._execute(f"ALTER TABLE nodes ADD COLUMN {col_def[0]} {col_def[1]};")
+            except Exception:
+                pass
 
     def get_last_pushed_date(self) -> Optional[str]:
         rows = self._query("SELECT last_pushed_date FROM fetch_logs ORDER BY id DESC LIMIT 1;")
@@ -403,37 +415,79 @@ class D1Database(Database):
 
         return total_added
 
-    def get_nodes_for_testing(self, limit: int = 50) -> List[Dict[str, Any]]:
-        sql = """
-        SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count
-        FROM nodes
-        WHERE status IN ('untested', 'active')
-        ORDER BY CASE status WHEN 'untested' THEN 0 ELSE 1 END,
-                 last_tested ASC
-        LIMIT ?;
-        """
+    def get_nodes_for_testing(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
+        if region == "global":
+            sql = """
+            SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count
+            FROM nodes
+            WHERE status IN ('untested', 'active') OR global_is_active IS NULL
+            ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
+                     global_last_tested ASC
+            LIMIT ?;
+            """
+        else:
+            sql = """
+            SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count
+            FROM nodes
+            WHERE (global_is_active = 1 OR global_is_active IS NULL)
+              AND (cn_is_active IS NULL OR cn_is_active = 1 OR status = 'untested')
+            ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
+                     cn_last_tested ASC
+            LIMIT ?;
+            """
         return self._query(sql, [limit])
 
     def update_test_result(
-        self, node_id: int, status: str, delay_ms: int, speed_mbps: float, fail_count: int
+        self,
+        node_id: int,
+        status: str,
+        delay_ms: int,
+        speed_mbps: float,
+        fail_count: int,
+        region: str = "cn",
     ) -> None:
         is_active = 1 if status == "active" else 0
-        sql = """
-        UPDATE nodes
-        SET status = ?, is_active = ?, delay_ms = ?, speed_mbps = ?, fail_count = ?, last_tested = CURRENT_TIMESTAMP
-        WHERE id = ?;
-        """
-        self._execute(sql, [status, is_active, delay_ms, speed_mbps, fail_count, node_id])
+        if region == "global":
+            sql = """
+            UPDATE nodes
+            SET global_is_active = ?, global_delay_ms = ?, global_last_tested = CURRENT_TIMESTAMP,
+                status = CASE WHEN ? = 0 AND fail_count >= 3 THEN 'dead' ELSE status END,
+                is_active = CASE WHEN ? = 0 AND fail_count >= 3 THEN 0 ELSE is_active END,
+                fail_count = CASE WHEN ? = 0 THEN fail_count + 1 ELSE fail_count END
+            WHERE id = ?;
+            """
+            self._execute(sql, [is_active, delay_ms, is_active, is_active, is_active, node_id])
+        else:
+            sql = """
+            UPDATE nodes
+            SET status = ?, is_active = ?, delay_ms = ?, speed_mbps = ?, fail_count = ?, last_tested = CURRENT_TIMESTAMP,
+                cn_is_active = ?, cn_delay_ms = ?, cn_last_tested = CURRENT_TIMESTAMP
+            WHERE id = ?;
+            """
+            self._execute(sql, [status, is_active, delay_ms, speed_mbps, fail_count, is_active, delay_ms, node_id])
 
-    def get_active_nodes(self, limit: int = 50) -> List[Dict[str, Any]]:
-        sql = """
-        SELECT id, node_url, protocol, delay_ms, speed_mbps
-        FROM nodes
-        WHERE status = 'active' AND delay_ms > 0
-        ORDER BY delay_ms ASC, speed_mbps DESC
-        LIMIT ?;
-        """
+    def get_active_nodes(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
+        if region == "global":
+            sql = """
+            SELECT id, node_url, protocol,
+                   COALESCE(global_delay_ms, delay_ms) AS delay_ms, speed_mbps
+            FROM nodes
+            WHERE global_is_active = 1 AND COALESCE(global_delay_ms, delay_ms) > 0
+            ORDER BY delay_ms ASC, speed_mbps DESC
+            LIMIT ?;
+            """
+        else:
+            sql = """
+            SELECT id, node_url, protocol,
+                   COALESCE(cn_delay_ms, delay_ms) AS delay_ms, speed_mbps
+            FROM nodes
+            WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
+              AND COALESCE(cn_delay_ms, delay_ms) > 0
+            ORDER BY delay_ms ASC, speed_mbps DESC
+            LIMIT ?;
+            """
         return self._query(sql, [limit])
+
 
     def get_stats(self) -> Dict[str, Any]:
         sql = """

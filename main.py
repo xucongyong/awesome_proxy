@@ -94,7 +94,15 @@ def setup_cli() -> argparse.ArgumentParser:
         default=None,
         help="Display top N active nodes ranked by latency and speed (default: 20)",
     )
+    parser.add_argument(
+        "--region",
+        type=str,
+        choices=["cn", "global"],
+        default="cn",
+        help="Testing perspective/target region: 'cn' (China domestic) or 'global' (overseas VPS) (default: cn)",
+    )
     return parser
+
 
 
 
@@ -156,15 +164,14 @@ def main() -> None:
         crawler.crawl(max_pages_per_keyword=args.pages)
 
     if args.test or args.all:
-        logger.info("--- Starting Module 2: sing-box Tester ---")
+        logger.info(f"--- Starting Module 2: sing-box Tester (Region: {args.region}) ---")
         tester = NodeTester(db=db, concurrency=args.concurrency)
-        tester.run(limit=args.limit, enable_speed_test=not args.no_speed_test)
-
+        tester.run(limit=args.limit, enable_speed_test=not args.no_speed_test, region=args.region)
 
     if args.export or args.all:
-        logger.info("--- Starting Module 3: Exporter ---")
+        logger.info(f"--- Starting Module 3: Exporter (Region: {args.region}) ---")
         exporter = Exporter(db=db)
-        out = exporter.export(limit=args.limit)
+        out = exporter.export(limit=args.limit, region=args.region)
         print("\nExport completed:")
         for k, v in out.items():
             print(f"  - {k}: {v}")
@@ -179,10 +186,11 @@ def main() -> None:
 
     if args.top:
         limit = args.top
-        active_nodes = db.get_active_nodes(limit=limit)
+        active_nodes = db.get_active_nodes(limit=limit, region=args.region)
         print(f"\n{'='*82}")
-        print(f"       TOP {len(active_nodes)} 优质存活节点画像 (按延迟升序、带宽降序)")
+        print(f"       TOP {len(active_nodes)} 优质存活节点画像 ({args.region.upper()} 视角: 按延迟升序、带宽降序)")
         print(f"{'='*82}")
+
         if not active_nodes:
             print("  [提示] 当前库内暂无已测存活的节点。请先运行: python3 main.py --test 进行批量测速。")
         else:

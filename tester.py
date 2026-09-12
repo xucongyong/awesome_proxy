@@ -217,17 +217,19 @@ class NodeTester:
         self.db = db
         self.concurrency = concurrency
 
-    def run(self, limit: int = 50, enable_speed_test: bool = True) -> Dict[str, int]:
+    def run(
+        self, limit: int = 50, enable_speed_test: bool = True, region: str = "cn"
+    ) -> Dict[str, int]:
         """
         Run test cycle on candidate nodes from the database.
         Returns statistics: {'tested': count, 'active': count, 'dead': count}
         """
-        nodes = self.db.get_nodes_for_testing(limit=limit)
+        nodes = self.db.get_nodes_for_testing(limit=limit, region=region)
         if not nodes:
             logger.info("No nodes available for testing.")
             return {"tested": 0, "active": 0, "dead": 0}
 
-        logger.info(f"Starting test on {len(nodes)} nodes with concurrency={self.concurrency}")
+        logger.info(f"Starting test on {len(nodes)} nodes (region={region}) with concurrency={self.concurrency}")
         stats = {"tested": 0, "active": 0, "dead": 0}
 
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
@@ -245,7 +247,9 @@ class NodeTester:
                         delay_ms=delay_ms,
                         speed_mbps=speed_mbps,
                         fail_count=fail_count,
+                        region=region,
                     )
+
                     stats["tested"] += 1
                     if status == "active":
                         stats["active"] += 1

@@ -91,13 +91,14 @@ class Exporter:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def export(self, limit: int = DEFAULT_EXPORT_LIMIT) -> Dict[str, str]:
+    def export(self, limit: int = DEFAULT_EXPORT_LIMIT, region: str = "cn") -> Dict[str, str]:
         """
         Query active nodes from the database and export them.
         Returns a dict with paths of generated files.
         """
-        active_nodes = self.db.get_active_nodes(limit=limit)
-        logger.info(f"Found {len(active_nodes)} active nodes for export.")
+        active_nodes = self.db.get_active_nodes(limit=limit, region=region)
+        logger.info(f"Found {len(active_nodes)} active nodes (region={region}) for export.")
+
 
         node_urls = [node["node_url"] for node in active_nodes]
 
