@@ -72,25 +72,26 @@ flowchart TD
 
 登录服务器后，执行 `crontab -e` 即可配置定时任务。
 
-### 海外服务器 Crontab 配置 (粗筛与爬取)
-> 假设项目部署在 `/data/get_all_proxy`，Python 路径为 `python3`
+### 海外服务器 (Alpine Linux) Crontab 配置 (粗筛与爬取)
+> 海外服务器部署目录：`/home/frog/awesome_proxy`
 
 ```bash
 # -------------------------------------------------------------
 # 1. 每 2 小时运行一次 GitHub 增量爬虫，挖掘最新上线的节点
 # -------------------------------------------------------------
-0 */2 * * * cd /data/get_all_proxy && python3 main.py --crawl --pages 5 >> logs/cron_crawl.log 2>&1
+0 */2 * * * cd /home/frog/awesome_proxy && python3 main.py --crawl --pages 5 >> logs/cron_crawl.log 2>&1
 
 # -------------------------------------------------------------
 # 2. 每 1 小时对新入库未测试的节点进行海外粗筛 (30 并发，只测延迟)
 # -------------------------------------------------------------
-10 * * * * cd /data/get_all_proxy && python3 main.py --test --limit 300 --concurrency 30 --no-speed-test --region global >> logs/cron_test_global.log 2>&1
+10 * * * * cd /home/frog/awesome_proxy && python3 main.py --test --limit 300 --concurrency 30 --no-speed-test --region global >> logs/cron_test_global.log 2>&1
 
 # -------------------------------------------------------------
 # 3. 每天凌晨 3:00 对失效节点做一次“打捞复活”（死节点中常有 3%~5% 是临时关机重启）
 # -------------------------------------------------------------
-0 3 * * * cd /data/get_all_proxy && python3 main.py --test --limit 1000 --concurrency 50 --no-speed-test --region global >> logs/cron_revive.log 2>&1
+0 3 * * * cd /home/frog/awesome_proxy && python3 main.py --test --limit 1000 --concurrency 50 --no-speed-test --region global >> logs/cron_revive.log 2>&1
 ```
+
 
 ---
 
