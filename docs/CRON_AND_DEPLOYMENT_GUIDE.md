@@ -94,25 +94,27 @@ flowchart TD
 
 ---
 
-### 国内服务器 Crontab 配置 (精筛与出库)
-> 国内服务器只测试在海外已被确认为活的节点，负担极轻、安全无风控！
+### 国内服务器 (ImmortalWrt) Crontab 配置 (精筛与出库)
+> 国内服务器部署目录：`/overlay/nas_data/120code/awesome_proxy`
+> 只测试在海外已被确认为活的节点，负担极轻、安全无风控！
 
 ```bash
 # -------------------------------------------------------------
-# 1. 每 30 分钟：对海外存活的节点进行国内连通性与时延测试 (高频轻量)
+# 1. 每 30 分钟：对海外存活节点做国内连通性测试 (轻量高频，只测延时)
 # -------------------------------------------------------------
-*/30 * * * * cd /data/get_all_proxy && python3 main.py --test --limit 200 --concurrency 20 --no-speed-test --region cn >> logs/cron_test_cn.log 2>&1
+*/30 * * * * cd /overlay/nas_data/120code/awesome_proxy && python3 main.py --test --limit 200 --concurrency 20 --no-speed-test --region cn >> logs/cron_test_cn.log 2>&1
 
 # -------------------------------------------------------------
-# 2. 每 4 小时：对当前国内存活的最优节点进行真实下载带宽测速 (抽样 2 秒，计算真实 Mbps)
+# 2. 每 4 小时：对国内活节点进行真实下载带宽测速 (更新实际下载 Mbps)
 # -------------------------------------------------------------
-15 */4 * * * cd /data/get_all_proxy && python3 main.py --test --limit 50 --concurrency 10 --region cn >> logs/cron_speed_cn.log 2>&1
+15 */4 * * * cd /overlay/nas_data/120code/awesome_proxy && python3 main.py --test --limit 50 --concurrency 10 --region cn >> logs/cron_speed_cn.log 2>&1
 
 # -------------------------------------------------------------
-# 3. 每次测完后自动导出国内专属可用订阅 (生成 Base64 与 sing-box 配置)
+# 3. 每小时：导出最优 50 个国内可用节点，并自动发布到软路由 Web 目录
 # -------------------------------------------------------------
-35 * * * * cd /data/get_all_proxy && python3 main.py --export --limit 50 --region cn >> logs/cron_export.log 2>&1
+35 * * * * cd /overlay/nas_data/120code/awesome_proxy && python3 main.py --export --limit 50 --region cn && cp output/subscription.txt /www/sub.txt && cp output/config.json /www/config.json 2>&1
 ```
+
 
 ---
 
