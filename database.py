@@ -66,6 +66,10 @@ class Database:
     def get_stats(self) -> Dict[str, Any]:
         raise NotImplementedError
 
+    def clean_dead_nodes(self, days: int = 30) -> int:
+        raise NotImplementedError
+
+
 
 
 class SQLiteDatabase(Database):
@@ -283,6 +287,16 @@ class SQLiteDatabase(Database):
             untested = conn.execute("SELECT COUNT(*) FROM nodes WHERE status = 'untested'").fetchone()[0]
             dead = conn.execute("SELECT COUNT(*) FROM nodes WHERE status = 'dead'").fetchone()[0]
             return {"total": total, "active": active, "untested": untested, "dead": dead}
+
+    def clean_dead_nodes(self, days: int = 30) -> int:
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                f"DELETE FROM nodes WHERE status = 'dead' AND fail_count >= 3 AND datetime(last_tested) < datetime('now', '-{days} days');"
+            )
+            deleted = cur.rowcount
+            conn.commit()
+            return max(0, deleted)
+
 
 
 class D1Database(Database):
@@ -506,6 +520,13 @@ class D1Database(Database):
                 "dead": rows[0].get("dead", 0),
             }
         return {"total": 0, "active": 0, "untested": 0, "dead": 0}
+
+    def clean_dead_nodes(self, days: int = 30) -> int:
+        sql = f"DELETE FROM nodes WHERE status = 'dead' AND fail_count >= 3 AND datetime(last_tested) < datetime('now', '-{days} days');"
+        res = self._execute(sql)
+        meta = res.get("meta", {})
+        return meta.get("changes", 0)
+
 
 
 def get_database(force_local: bool = False, db_path: Optional[str] = None) -> Database:

@@ -101,7 +101,20 @@ def setup_cli() -> argparse.ArgumentParser:
         default="cn",
         help="Testing perspective/target region: 'cn' (China domestic) or 'global' (overseas VPS) (default: cn)",
     )
+    parser.add_argument(
+        "--clean-dead",
+        action="store_true",
+        help="Purge old dead nodes that have been inactive for more than --days (default: 30 days)",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Days threshold for purging dead nodes (default: 30)",
+    )
     return parser
+
+
 
 
 
@@ -124,6 +137,12 @@ def main() -> None:
         logger.info("Initializing database tables...")
         db.init_db()
         logger.info("Database schema initialized successfully.")
+
+    if args.clean_dead:
+        logger.info(f"Purging dead nodes inactive for more than {args.days} days...")
+        deleted = db.clean_dead_nodes(days=args.days)
+        logger.info(f"Purged {deleted} dead nodes from database.")
+
 
     if args.import_file:
         file_path = Path(args.import_file)
