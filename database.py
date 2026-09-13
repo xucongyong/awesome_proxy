@@ -129,6 +129,10 @@ class SQLiteDatabase(Database):
                 CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
                 CREATE INDEX IF NOT EXISTS idx_nodes_delay ON nodes(delay_ms);
                 CREATE INDEX IF NOT EXISTS idx_nodes_active ON nodes(is_active);
+                CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON nodes(cn_is_active);
+                CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON nodes(global_is_active);
+                CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON nodes(cn_last_tested);
+                CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON nodes(global_last_tested);
                 """
             )
             for col_def in [
@@ -418,6 +422,10 @@ class D1Database(Database):
         CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
         CREATE INDEX IF NOT EXISTS idx_nodes_delay ON nodes(delay_ms);
         CREATE INDEX IF NOT EXISTS idx_nodes_active ON nodes(is_active);
+        CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON nodes(cn_is_active);
+        CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON nodes(global_is_active);
+        CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON nodes(cn_last_tested);
+        CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON nodes(global_last_tested);
         """
         self._execute(sql)
         for col_def in [
@@ -480,28 +488,40 @@ class D1Database(Database):
         return total_added
 
     def get_nodes_for_testing(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
-        if region == "global":
-            sql = """
-            SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
-            FROM nodes
-            WHERE status IN ('untested', 'active') OR global_is_active IS NULL
-            ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
-                     CASE WHEN global_is_active IS NULL THEN id END DESC,
-                     global_last_tested ASC
-            LIMIT ?;
-            """
-        else:
-            sql = """
-            SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
-            FROM nodes
-            WHERE (global_is_active = 1 OR global_is_active IS NULL)
-              AND (cn_is_active IS NULL OR cn_is_active = 1 OR status = 'untested')
-            ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
-                     CASE WHEN cn_is_active IS NULL THEN id END DESC,
-                     cn_last_tested ASC
-            LIMIT ?;
-            """
-        return self._query(sql, [limit])
+        page_size = min(limit, 3000)
+        total_rows: List[Dict[str, Any]] = []
+        offset = 0
+        while len(total_rows) < limit:
+            fetch_limit = min(page_size, limit - len(total_rows))
+            if region == "global":
+                sql = f"""
+                SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
+                FROM nodes
+                WHERE status IN ('untested', 'active') OR global_is_active IS NULL
+                ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
+                         CASE WHEN global_is_active IS NULL THEN id END DESC,
+                         global_last_tested ASC
+                LIMIT ? OFFSET ?;
+                """
+            else:
+                sql = f"""
+                SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
+                FROM nodes
+                WHERE (global_is_active = 1 OR global_is_active IS NULL)
+                  AND (cn_is_active IS NULL OR cn_is_active = 1 OR status = 'untested')
+                ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
+                         CASE WHEN cn_is_active IS NULL THEN id END DESC,
+                         cn_last_tested ASC
+                LIMIT ? OFFSET ?;
+                """
+            rows = self._query(sql, [fetch_limit, offset])
+            if not rows:
+                break
+            total_rows.extend(rows)
+            if len(rows) < fetch_limit:
+                break
+            offset += len(rows)
+        return total_rows
 
     def update_test_result(
         self,

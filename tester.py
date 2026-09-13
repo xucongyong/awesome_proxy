@@ -409,41 +409,42 @@ class NodeTester:
         """
         if all_nodes or limit <= 0:
             logger.info(
-                f"Starting FULL test on all untested nodes (region={region}) with concurrency={self.concurrency}"
+                f"Starting FULL test on all candidate nodes (region={region}) with concurrency={self.concurrency}"
             )
             total_stats = {"tested": 0, "active": 0, "dead": 0}
-            batch_size = max(self.concurrency * 10, 200)
-            seen_node_ids = set()
+            batch_size = max(self.concurrency * 10, 500)
 
-            while True:
-                nodes = self.db.get_nodes_for_testing(limit=batch_size, region=region)
-                untested_candidates = []
-                for n in nodes:
-                    nid = n["id"]
-                    if nid in seen_node_ids:
-                        continue
-                    if region == "global" and n.get("global_is_active") is not None:
-                        continue
-                    if region == "cn" and n.get("cn_is_active") is not None:
-                        continue
-                    untested_candidates.append(n)
-                    seen_node_ids.add(nid)
+            logger.info(f"Loading candidate nodes in a single read to minimize database queries...")
+            all_candidates = self.db.get_nodes_for_testing(limit=15000, region=region)
+            if not all_candidates:
+                logger.info(f"No candidate nodes available for testing in region '{region}'.")
+                return total_stats
 
-                if not untested_candidates:
-                    logger.info(f"All un-tested nodes in region '{region}' have been completely tested!")
-                    break
+            # Prioritize untested nodes first, then active/retest nodes
+            untested = [
+                n for n in all_candidates
+                if (region == "global" and n.get("global_is_active") is None)
+                or (region == "cn" and n.get("cn_is_active") is None)
+            ]
+            candidates = untested if untested else all_candidates
 
-                logger.info(f"Processing batch of {len(untested_candidates)} untested nodes...")
-                b_stats = self._test_batch(
-                    untested_candidates, enable_speed_test=enable_speed_test, region=region
-                )
+            total_count = len(candidates)
+            total_batches = (total_count + batch_size - 1) // batch_size
+            logger.info(f"Loaded {total_count} nodes for testing ({total_batches} batches of {batch_size}).")
+
+            for i in range(0, total_count, batch_size):
+                batch = candidates[i : i + batch_size]
+                batch_num = i // batch_size + 1
+                logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} nodes)...")
+                b_stats = self._test_batch(batch, enable_speed_test=enable_speed_test, region=region)
                 total_stats["tested"] += b_stats["tested"]
                 total_stats["active"] += b_stats["active"]
                 total_stats["dead"] += b_stats["dead"]
                 logger.info(
-                    f"Cumulative progress: Tested {total_stats['tested']} | Active {total_stats['active']} | Dead {total_stats['dead']}"
+                    f"Cumulative progress: Tested {total_stats['tested']}/{total_count} | Active {total_stats['active']} | Dead {total_stats['dead']}"
                 )
 
+            logger.info(f"Full test finished. Stats: {total_stats}")
             return total_stats
 
         nodes = self.db.get_nodes_for_testing(limit=limit, region=region)
