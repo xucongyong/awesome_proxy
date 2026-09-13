@@ -210,6 +210,146 @@ def test_single_node(
                 pass
 
 
+def test_nodes_batch_singbox_clash(
+    nodes: list,
+    concurrency: int = 50,
+    test_url: str = TEST_URL,
+    timeout_sec: float = TEST_TIMEOUT,
+) -> Optional[List[Tuple[int, str, int, float, int]]]:
+    """
+    High-performance batch tester using a single sing-box process with Clash API.
+    All outbounds are evaluated asynchronously by the sing-box core in Go.
+    Returns list of (node_id, status, delay_ms, speed_mbps, fail_count), or None if fallback needed.
+    """
+    results: List[Tuple[int, str, int, float, int]] = []
+    valid_outbounds: List[Dict[str, Any]] = [{"type": "direct", "tag": "direct"}]
+    testable_nodes: Dict[str, Dict[str, Any]] = {}
+
+    for node in nodes:
+        node_id = node["id"]
+        node_url = node["node_url"]
+        current_fail = node.get("fail_count", 0)
+        tag = f"node_{node_id}"
+
+        outbound_cfg = parse_node_url(node_url, tag=tag)
+        if not outbound_cfg:
+            new_fail = current_fail + 1
+            new_status = "dead" if new_fail >= MAX_FAIL_COUNT else "untested"
+            results.append((node_id, new_status, -1, 0.0, new_fail))
+            continue
+
+        server = outbound_cfg.get("server")
+        server_port = outbound_cfg.get("server_port")
+        proto_type = outbound_cfg.get("type", "")
+
+        # Optional fast TCP precheck
+        if FAST_TCP_PRECHECK and proto_type not in ("hysteria2", "tuic") and server and server_port:
+            if not check_tcp_reachable(server, server_port, timeout=TCP_PING_TIMEOUT):
+                new_fail = current_fail + 1
+                new_status = "dead" if new_fail >= MAX_FAIL_COUNT else "untested"
+                results.append((node_id, new_status, -1, 0.0, new_fail))
+                continue
+
+        valid_outbounds.append(outbound_cfg)
+        testable_nodes[tag] = node
+
+    if not testable_nodes:
+        return results
+
+    clash_port = get_free_port()
+    mixed_port = get_free_port()
+
+    cfg = {
+        "log": {"level": "warn"},
+        "experimental": {
+            "clash_api": {
+                "external_controller": f"127.0.0.1:{clash_port}"
+            }
+        },
+        "inbounds": [
+            {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": mixed_port}
+        ],
+        "outbounds": valid_outbounds,
+    }
+
+    temp_cfg = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    proc: Optional[subprocess.Popen] = None
+
+    try:
+        json.dump(cfg, temp_cfg)
+        temp_cfg.close()
+
+        proc = subprocess.Popen(
+            [SING_BOX_PATH, "run", "-c", temp_cfg.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Wait for Clash API to become ready
+        ready = False
+        for _ in range(30):
+            try:
+                r = requests.get(f"http://127.0.0.1:{clash_port}/version", timeout=0.2)
+                if r.status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                time.sleep(0.05)
+
+        if not ready or proc.poll() is not None:
+            logger.warning("Batch sing-box process failed to initialize Clash API, falling back.")
+            return None
+
+        # Concurrently query each outbound's delay via Clash API
+        session = requests.Session()
+        timeout_ms = int(timeout_sec * 1000)
+
+        def query_delay(item: Tuple[str, Dict[str, Any]]) -> Tuple[int, str, int, float, int]:
+            tag, n = item
+            nid = n["id"]
+            cf = n.get("fail_count", 0)
+            try:
+                url = f"http://127.0.0.1:{clash_port}/proxies/{tag}/delay?url={test_url}&timeout={timeout_ms}"
+                resp = session.get(url, timeout=timeout_sec + 1.0)
+                if resp.status_code == 200:
+                    delay = resp.json().get("delay", -1)
+                    if delay > 0:
+                        logger.info(f"Node {nid} [ACTIVE] | Delay: {delay}ms")
+                        return (nid, "active", delay, 0.0, 0)
+            except Exception:
+                pass
+
+            nf = cf + 1
+            ns = "dead" if nf >= MAX_FAIL_COUNT else "untested"
+            return (nid, ns, -1, 0.0, nf)
+
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            batch_tested = list(executor.map(query_delay, testable_nodes.items()))
+
+        results.extend(batch_tested)
+        return results
+
+    except Exception as e:
+        logger.warning(f"Error in batch sing-box test: {e}, falling back to single tests.")
+        return None
+
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if os.path.exists(temp_cfg.name):
+            try:
+                os.remove(temp_cfg.name)
+            except Exception:
+                pass
+
+
 class NodeTester:
     """Batch tester coordinating sing-box testing with concurrency."""
 
@@ -221,31 +361,38 @@ class NodeTester:
         self, nodes: list, enable_speed_test: bool = True, region: str = "cn"
     ) -> Dict[str, int]:
         stats = {"tested": 0, "active": 0, "dead": 0}
-        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-            futures = {
-                executor.submit(test_single_node, node, enable_speed_test): node
-                for node in nodes
-            }
+        results = None
 
-            for future in as_completed(futures):
-                try:
-                    node_id, status, delay_ms, speed_mbps, fail_count = future.result()
-                    self.db.update_test_result(
-                        node_id=node_id,
-                        status=status,
-                        delay_ms=delay_ms,
-                        speed_mbps=speed_mbps,
-                        fail_count=fail_count,
-                        region=region,
-                    )
+        # If speed test is disabled, use the ultra-fast sing-box Clash API batch engine
+        if not enable_speed_test:
+            results = test_nodes_batch_singbox_clash(
+                nodes, concurrency=self.concurrency, test_url=TEST_URL, timeout_sec=TEST_TIMEOUT
+            )
 
-                    stats["tested"] += 1
-                    if status == "active":
-                        stats["active"] += 1
-                    elif status == "dead":
-                        stats["dead"] += 1
-                except Exception as e:
-                    logger.error(f"Error executing test task: {e}")
+        # Fallback to single node executor if batch engine was skipped or failed
+        if results is None:
+            results = []
+            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                futures = {
+                    executor.submit(test_single_node, node, enable_speed_test): node
+                    for node in nodes
+                }
+                for future in as_completed(futures):
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        logger.error(f"Error executing test task: {e}")
+
+        # High-speed batch update to database
+        self.db.update_test_results_batch(results, region=region)
+
+        for nid, status, delay_ms, speed_mbps, fail_count in results:
+            stats["tested"] += 1
+            if status == "active":
+                stats["active"] += 1
+            elif status == "dead":
+                stats["dead"] += 1
+
         return stats
 
     def run(

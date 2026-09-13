@@ -60,6 +60,14 @@ class Database:
     ) -> None:
         raise NotImplementedError
 
+    def update_test_results_batch(
+        self,
+        results: List[Tuple[int, str, int, float, int]],
+        region: str = "cn",
+    ) -> None:
+        for node_id, status, delay_ms, speed_mbps, fail_count in results:
+            self.update_test_result(node_id, status, delay_ms, speed_mbps, fail_count, region=region)
+
     def get_active_nodes(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
         raise NotImplementedError
 
@@ -249,6 +257,46 @@ class SQLiteDatabase(Database):
                     WHERE id = ?
                     """,
                     (status, is_active, delay_ms, speed_mbps, fail_count, is_active, delay_ms, node_id),
+                )
+            conn.commit()
+
+    def update_test_results_batch(
+        self,
+        results: List[Tuple[int, str, int, float, int]],
+        region: str = "cn",
+    ) -> None:
+        if not results:
+            return
+        with self._get_connection() as conn:
+            if region == "global":
+                data = [
+                    (1 if s == "active" else 0, d, 1 if s == "active" else 0, 1 if s == "active" else 0, 1 if s == "active" else 0, nid)
+                    for (nid, s, d, sp, fc) in results
+                ]
+                conn.executemany(
+                    """
+                    UPDATE nodes
+                    SET global_is_active = ?, global_delay_ms = ?, global_last_tested = CURRENT_TIMESTAMP,
+                        status = CASE WHEN ? = 0 AND fail_count >= 3 THEN 'dead' ELSE status END,
+                        is_active = CASE WHEN ? = 0 AND fail_count >= 3 THEN 0 ELSE is_active END,
+                        fail_count = CASE WHEN ? = 0 THEN fail_count + 1 ELSE fail_count END
+                    WHERE id = ?
+                    """,
+                    data,
+                )
+            else:
+                data = [
+                    (s, 1 if s == "active" else 0, d, sp, fc, 1 if s == "active" else 0, d, nid)
+                    for (nid, s, d, sp, fc) in results
+                ]
+                conn.executemany(
+                    """
+                    UPDATE nodes
+                    SET status = ?, is_active = ?, delay_ms = ?, speed_mbps = ?, fail_count = ?, last_tested = CURRENT_TIMESTAMP,
+                        cn_is_active = ?, cn_delay_ms = ?, cn_last_tested = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    data,
                 )
             conn.commit()
 
@@ -483,6 +531,42 @@ class D1Database(Database):
             WHERE id = ?;
             """
             self._execute(sql, [status, is_active, delay_ms, speed_mbps, fail_count, is_active, delay_ms, node_id])
+
+    def update_test_results_batch(
+        self,
+        results: List[Tuple[int, str, int, float, int]],
+        region: str = "cn",
+        chunk_size: int = 50,
+    ) -> None:
+        if not results:
+            return
+        for i in range(0, len(results), chunk_size):
+            chunk = results[i : i + chunk_size]
+            statements = []
+            for (nid, s, d, sp, fc) in chunk:
+                is_active = 1 if s == "active" else 0
+                safe_status = "active" if s == "active" else ("dead" if s == "dead" else "untested")
+                node_id = int(nid)
+                delay_ms = int(d)
+                fail_count = int(fc)
+                speed_mbps = float(sp)
+                if region == "global":
+                    statements.append(
+                        f"UPDATE nodes SET global_is_active = {is_active}, global_delay_ms = {delay_ms}, global_last_tested = CURRENT_TIMESTAMP, "
+                        f"status = CASE WHEN {is_active} = 0 AND fail_count >= 3 THEN 'dead' ELSE status END, "
+                        f"is_active = CASE WHEN {is_active} = 0 AND fail_count >= 3 THEN 0 ELSE is_active END, "
+                        f"fail_count = CASE WHEN {is_active} = 0 THEN fail_count + 1 ELSE fail_count END "
+                        f"WHERE id = {node_id};"
+                    )
+                else:
+                    statements.append(
+                        f"UPDATE nodes SET status = '{safe_status}', is_active = {is_active}, delay_ms = {delay_ms}, speed_mbps = {speed_mbps}, "
+                        f"fail_count = {fail_count}, last_tested = CURRENT_TIMESTAMP, "
+                        f"cn_is_active = {is_active}, cn_delay_ms = {delay_ms}, cn_last_tested = CURRENT_TIMESTAMP "
+                        f"WHERE id = {node_id};"
+                    )
+            sql = "\n".join(statements)
+            self._execute(sql)
 
     def get_active_nodes(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
         if region == "global":

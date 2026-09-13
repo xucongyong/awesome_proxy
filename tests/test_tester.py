@@ -49,9 +49,9 @@ class TestTester(unittest.TestCase):
             ])
             tester = NodeTester(db=db, concurrency=2)
 
-            with patch("tester.test_single_node") as mock_test:
-                mock_test.side_effect = [
-                    (1, "active", 100, 10.0, 0),
+            with patch("tester.test_nodes_batch_singbox_clash") as mock_batch:
+                mock_batch.return_value = [
+                    (1, "active", 100, 0.0, 0),
                     (2, "dead", -1, 0.0, 3),
                 ]
                 stats = tester.run(enable_speed_test=False, region="cn", all_nodes=True)
