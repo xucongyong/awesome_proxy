@@ -56,6 +56,7 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(len(nodes), 2)
         node_1 = nodes[0]
         self.assertEqual(node_1["status"], "untested")
+        self.assertEqual(node_1["node_url"], "trojan://u2@example.com:443")
 
         # Update test result
         self.db.update_test_result(

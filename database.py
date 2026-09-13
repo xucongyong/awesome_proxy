@@ -195,6 +195,7 @@ class SQLiteDatabase(Database):
                     FROM nodes
                     WHERE status IN ('untested', 'active') OR global_is_active IS NULL
                     ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
+                             CASE WHEN global_is_active IS NULL THEN id END DESC,
                              global_last_tested ASC NULLS FIRST
                     LIMIT ?
                     """,
@@ -208,6 +209,7 @@ class SQLiteDatabase(Database):
                     WHERE (global_is_active = 1 OR global_is_active IS NULL)
                       AND (cn_is_active IS NULL OR cn_is_active = 1 OR status = 'untested')
                     ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
+                             CASE WHEN cn_is_active IS NULL THEN id END DESC,
                              cn_last_tested ASC NULLS FIRST
                     LIMIT ?
                     """,
@@ -436,6 +438,7 @@ class D1Database(Database):
             FROM nodes
             WHERE status IN ('untested', 'active') OR global_is_active IS NULL
             ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
+                     CASE WHEN global_is_active IS NULL THEN id END DESC,
                      global_last_tested ASC
             LIMIT ?;
             """
@@ -446,6 +449,7 @@ class D1Database(Database):
             WHERE (global_is_active = 1 OR global_is_active IS NULL)
               AND (cn_is_active IS NULL OR cn_is_active = 1 OR status = 'untested')
             ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
+                     CASE WHEN cn_is_active IS NULL THEN id END DESC,
                      cn_last_tested ASC
             LIMIT ?;
             """
