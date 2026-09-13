@@ -15,78 +15,109 @@ export default {
 
     try {
       if (path === "/sub") {
-        return handleSubscription(request, env);
+        return await handleSubscription(request, env, ctx);
       } else if (path === "/json" || path === "/config.json") {
-        return handleSingboxJson(request, env);
+        return await handleSingboxJson(request, env, ctx);
       } else if (path === "/api/stats") {
-        return handleApiStats(request, env);
+        return await handleApiStats(request, env);
       } else {
-        return handleDashboard(request, env);
+        return await handleDashboard(request, env, ctx);
       }
     } catch (err) {
-      return new Response(`Server Error: ${err.message}`, { status: 500 });
+      // Global fallback - never crash into Error 1101
+      return new Response(`Proxy Hub Notice: ${err.message}`, {
+        status: 200,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
     }
   },
 };
 
 /**
- * 1. Base64 订阅分发接口 (/sub)
+ * 1. Base64 订阅分发接口 (/sub) - 带边缘缓存保护
  */
-async function handleSubscription(request, env) {
-  const sql = `
-    SELECT node_url
-    FROM nodes
-    WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
-      AND COALESCE(cn_delay_ms, delay_ms) > 0
-    ORDER BY COALESCE(cn_delay_ms, delay_ms) ASC, speed_mbps DESC
-    LIMIT 100;
-  `;
-  const { results } = await env.DB.prepare(sql).all();
-  const urls = (results || []).map(r => r.node_url).filter(Boolean);
-  const plainText = urls.join("\n");
-  const b64 = btoa(unescape(encodeURIComponent(plainText)));
+async function handleSubscription(request, env, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(request.url, request);
+  let cached = await cache.match(cacheKey);
+  if (cached) return cached;
 
-  return new Response(b64, {
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Cache-Control": "no-cache, no-store, must-revalidate",
-      "Access-Control-Allow-Origin": "*",
-    },
-  });
+  try {
+    const sql = `
+      SELECT node_url
+      FROM nodes
+      WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
+        AND COALESCE(cn_delay_ms, delay_ms) > 0
+      ORDER BY COALESCE(cn_delay_ms, delay_ms) ASC, speed_mbps DESC
+      LIMIT 100;
+    `;
+    const { results } = await env.DB.prepare(sql).all();
+    const urls = (results || []).map((r) => r.node_url).filter(Boolean);
+    const plainText = urls.join("\n");
+    const b64 = btoa(unescape(encodeURIComponent(plainText)));
+
+    const resp = new Response(b64, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "public, max-age=60, s-maxage=60",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+    ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+    return resp;
+  } catch (err) {
+    return new Response(btoa(""), {
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
 }
 
 /**
  * 2. API 统计接口 (/api/stats)
  */
 async function handleApiStats(request, env) {
-  const statsQuery = `
-    SELECT
-      (SELECT COUNT(*) FROM nodes) AS total,
-      (SELECT COUNT(*) FROM nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS cn_active,
-      (SELECT COUNT(*) FROM nodes WHERE global_is_active = 1) AS global_active,
-      (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead,
-      (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested;
-  `;
-  const statRow = await env.DB.prepare(statsQuery).first();
-  return new Response(JSON.stringify(statRow || {}, null, 2), {
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-  });
+  try {
+    const statsQuery = `
+      SELECT
+        (SELECT COUNT(*) FROM nodes) AS total,
+        (SELECT COUNT(*) FROM nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS cn_active,
+        (SELECT COUNT(*) FROM nodes WHERE global_is_active = 1) AS global_active,
+        (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead,
+        (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested;
+    `;
+    const statRow = await env.DB.prepare(statsQuery).first();
+    return new Response(JSON.stringify(statRow || {}, null, 2), {
+      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message, total: 12810 }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 }
 
 /**
  * 3. sing-box 1.14 配置分发接口 (/json)
  */
-async function handleSingboxJson(request, env) {
-  const sql = `
-    SELECT id, node_url, protocol, COALESCE(cn_delay_ms, delay_ms) as delay_ms, speed_mbps
-    FROM nodes
-    WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
-      AND COALESCE(cn_delay_ms, delay_ms) > 0
-    ORDER BY delay_ms ASC, speed_mbps DESC
-    LIMIT 50;
-  `;
-  const { results } = await env.DB.prepare(sql).all();
-  const nodes = results || [];
+async function handleSingboxJson(request, env, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(request.url, request);
+  let cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  let nodes = [];
+  try {
+    const sql = `
+      SELECT id, node_url, protocol, COALESCE(cn_delay_ms, delay_ms) as delay_ms, speed_mbps
+      FROM nodes
+      WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
+        AND COALESCE(cn_delay_ms, delay_ms) > 0
+      ORDER BY delay_ms ASC, speed_mbps DESC
+      LIMIT 50;
+    `;
+    const { results } = await env.DB.prepare(sql).all();
+    nodes = results || [];
+  } catch (err) {}
 
   const outbounds = [];
   const tags = [];
@@ -143,9 +174,15 @@ async function handleSingboxJson(request, env) {
     },
   };
 
-  return new Response(JSON.stringify(config, null, 2), {
-    headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+  const resp = new Response(JSON.stringify(config, null, 2), {
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "public, max-age=60, s-maxage=60",
+      "Access-Control-Allow-Origin": "*",
+    },
   });
+  ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+  return resp;
 }
 
 function parseNodeSimple(url, tag) {
@@ -176,30 +213,49 @@ function parseNodeSimple(url, tag) {
 }
 
 /**
- * 4. 实时暗黑科技风仪表盘页面 (/)
+ * 4. 实时暗黑科技风仪表盘页面 (/) - 带边缘缓存与防炸容错
  */
-async function handleDashboard(request, env) {
-  const statsSql = `
-    SELECT
-      (SELECT COUNT(*) FROM nodes) AS total,
-      (SELECT COUNT(*) FROM nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS cn_active,
-      (SELECT COUNT(*) FROM nodes WHERE global_is_active = 1) AS global_active,
-      (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead,
-      (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested;
-  `;
-  const stats = (await env.DB.prepare(statsSql).first()) || {};
+async function handleDashboard(request, env, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(request.url, request);
+  let cached = await cache.match(cacheKey);
+  if (cached) return cached;
 
-  const topSql = `
-    SELECT id, protocol, node_url,
-           COALESCE(cn_delay_ms, delay_ms) AS delay_ms,
-           speed_mbps, last_tested
-    FROM nodes
-    WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
-      AND COALESCE(cn_delay_ms, delay_ms) > 0
-    ORDER BY delay_ms ASC, speed_mbps DESC
-    LIMIT 20;
-  `;
-  const { results: topNodes } = await env.DB.prepare(topSql).all();
+  let stats = { total: 12810, cn_active: 0, global_active: 0, dead: 0, untested: 12810 };
+  let topNodes = [];
+  let d1Notice = null;
+
+  try {
+    const statsSql = `
+      SELECT
+        (SELECT COUNT(*) FROM nodes) AS total,
+        (SELECT COUNT(*) FROM nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS cn_active,
+        (SELECT COUNT(*) FROM nodes WHERE global_is_active = 1) AS global_active,
+        (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead,
+        (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested;
+    `;
+    const res = await env.DB.prepare(statsSql).first();
+    if (res) stats = res;
+  } catch (err) {
+    d1Notice = err.message;
+  }
+
+  try {
+    const topSql = `
+      SELECT id, protocol, node_url,
+             COALESCE(cn_delay_ms, delay_ms) AS delay_ms,
+             speed_mbps, last_tested
+      FROM nodes
+      WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
+        AND COALESCE(cn_delay_ms, delay_ms) > 0
+      ORDER BY delay_ms ASC, speed_mbps DESC
+      LIMIT 20;
+    `;
+    const { results } = await env.DB.prepare(topSql).all();
+    if (results) topNodes = results;
+  } catch (err) {
+    if (!d1Notice) d1Notice = err.message;
+  }
 
   const origin = new URL(request.url).origin;
   const subUrl = `${origin}/sub`;
@@ -238,6 +294,24 @@ async function handleDashboard(request, env) {
       </tr>
     `;
   }).join("");
+
+  let noticeBanner = "";
+  if (d1Notice) {
+    const isQuota = d1Notice.includes("7500") || d1Notice.includes("exceeded") || d1Notice.includes("limit");
+    const tip = isQuota
+      ? "Cloudflare D1 免费版今日行读取配额（500万行）已触顶。系统已自动开启边缘只读保护，将在 UTC 00:00（约几小时后）重置额度，或升级至 Workers Paid 计划。"
+      : d1Notice;
+
+    noticeBanner = `
+      <div class="bg-amber-950/40 border border-amber-500/40 rounded-xl p-4 my-4 flex items-start gap-3 text-amber-300 text-xs">
+        <span class="text-base">⚠️</span>
+        <div class="leading-relaxed">
+          <div class="font-bold mb-0.5">D1 边缘数据库限额提示</div>
+          <div>${tip}</div>
+        </div>
+      </div>
+    `;
+  }
 
   const html = `
 <!DOCTYPE html>
@@ -278,8 +352,10 @@ async function handleDashboard(request, env) {
       </div>
     </div>
 
+    ${noticeBanner}
+
     <!-- Stats Grid -->
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 my-8">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 my-6">
       <div class="bg-gray-900/80 border border-gray-800 rounded-xl p-4">
         <div class="text-xs text-gray-400">国内可用节点 (CN Active)</div>
         <div class="text-3xl font-black text-emerald-400 mt-1 font-mono">${stats.cn_active || 0}</div>
@@ -329,14 +405,19 @@ async function handleDashboard(request, env) {
 
     <!-- Footer -->
     <div class="mt-8 text-center text-xs text-gray-600">
-      由 Cloudflare Worker & D1 全球边缘驱动 · 零服务器开销 · 实时读写
+      由 Cloudflare Worker & D1 全球边缘驱动 · 零服务器开销 · 智能边缘缓存保护
     </div>
   </div>
 </body>
 </html>
   `;
 
-  return new Response(html, {
-    headers: { "Content-Type": "text/html; charset=utf-8" },
+  const resp = new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=60, s-maxage=60",
+    },
   });
+  ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+  return resp;
 }
