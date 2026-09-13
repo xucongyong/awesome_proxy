@@ -217,21 +217,10 @@ class NodeTester:
         self.db = db
         self.concurrency = concurrency
 
-    def run(
-        self, limit: int = 50, enable_speed_test: bool = True, region: str = "cn"
+    def _test_batch(
+        self, nodes: list, enable_speed_test: bool = True, region: str = "cn"
     ) -> Dict[str, int]:
-        """
-        Run test cycle on candidate nodes from the database.
-        Returns statistics: {'tested': count, 'active': count, 'dead': count}
-        """
-        nodes = self.db.get_nodes_for_testing(limit=limit, region=region)
-        if not nodes:
-            logger.info("No nodes available for testing.")
-            return {"tested": 0, "active": 0, "dead": 0}
-
-        logger.info(f"Starting test on {len(nodes)} nodes (region={region}) with concurrency={self.concurrency}")
         stats = {"tested": 0, "active": 0, "dead": 0}
-
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
             futures = {
                 executor.submit(test_single_node, node, enable_speed_test): node
@@ -257,6 +246,67 @@ class NodeTester:
                         stats["dead"] += 1
                 except Exception as e:
                     logger.error(f"Error executing test task: {e}")
+        return stats
 
+    def run(
+        self,
+        limit: int = 50,
+        enable_speed_test: bool = True,
+        region: str = "cn",
+        all_nodes: bool = False,
+    ) -> Dict[str, int]:
+        """
+        Run test cycle on candidate nodes from the database.
+        If all_nodes is True or limit <= 0: runs in continuous batches until all un-tested nodes in the region are processed.
+        Returns statistics: {'tested': count, 'active': count, 'dead': count}
+        """
+        if all_nodes or limit <= 0:
+            logger.info(
+                f"Starting FULL test on all untested nodes (region={region}) with concurrency={self.concurrency}"
+            )
+            total_stats = {"tested": 0, "active": 0, "dead": 0}
+            batch_size = max(self.concurrency * 10, 200)
+            seen_node_ids = set()
+
+            while True:
+                nodes = self.db.get_nodes_for_testing(limit=batch_size, region=region)
+                untested_candidates = []
+                for n in nodes:
+                    nid = n["id"]
+                    if nid in seen_node_ids:
+                        continue
+                    if region == "global" and n.get("global_is_active") is not None:
+                        continue
+                    if region == "cn" and n.get("cn_is_active") is not None:
+                        continue
+                    untested_candidates.append(n)
+                    seen_node_ids.add(nid)
+
+                if not untested_candidates:
+                    logger.info(f"All un-tested nodes in region '{region}' have been completely tested!")
+                    break
+
+                logger.info(f"Processing batch of {len(untested_candidates)} untested nodes...")
+                b_stats = self._test_batch(
+                    untested_candidates, enable_speed_test=enable_speed_test, region=region
+                )
+                total_stats["tested"] += b_stats["tested"]
+                total_stats["active"] += b_stats["active"]
+                total_stats["dead"] += b_stats["dead"]
+                logger.info(
+                    f"Cumulative progress: Tested {total_stats['tested']} | Active {total_stats['active']} | Dead {total_stats['dead']}"
+                )
+
+            return total_stats
+
+        nodes = self.db.get_nodes_for_testing(limit=limit, region=region)
+        if not nodes:
+            logger.info("No nodes available for testing.")
+            return {"tested": 0, "active": 0, "dead": 0}
+
+        logger.info(
+            f"Starting test on {len(nodes)} nodes (region={region}) with concurrency={self.concurrency}"
+        )
+        stats = self._test_batch(nodes, enable_speed_test=enable_speed_test, region=region)
         logger.info(f"Testing finished. Stats: {stats}")
         return stats

@@ -107,6 +107,11 @@ def setup_cli() -> argparse.ArgumentParser:
         help="Purge old dead nodes that have been inactive for more than --days (default: 30 days)",
     )
     parser.add_argument(
+        "--all-nodes",
+        action="store_true",
+        help="Run continuous testing across ALL un-tested candidate nodes in batches without stopping",
+    )
+    parser.add_argument(
         "--days",
         type=int,
         default=30,
@@ -185,7 +190,12 @@ def main() -> None:
     if args.test or args.all:
         logger.info(f"--- Starting Module 2: sing-box Tester (Region: {args.region}) ---")
         tester = NodeTester(db=db, concurrency=args.concurrency)
-        tester.run(limit=args.limit, enable_speed_test=not args.no_speed_test, region=args.region)
+        tester.run(
+            limit=args.limit,
+            enable_speed_test=not args.no_speed_test,
+            region=args.region,
+            all_nodes=args.all_nodes,
+        )
 
     if args.export or args.all:
         logger.info(f"--- Starting Module 3: Exporter (Region: {args.region}) ---")

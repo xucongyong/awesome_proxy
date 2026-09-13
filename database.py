@@ -191,7 +191,7 @@ class SQLiteDatabase(Database):
             if region == "global":
                 cur = conn.execute(
                     """
-                    SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count
+                    SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
                     FROM nodes
                     WHERE status IN ('untested', 'active') OR global_is_active IS NULL
                     ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
@@ -204,7 +204,7 @@ class SQLiteDatabase(Database):
             else:
                 cur = conn.execute(
                     """
-                    SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count
+                    SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
                     FROM nodes
                     WHERE (global_is_active = 1 OR global_is_active IS NULL)
                       AND (cn_is_active IS NULL OR cn_is_active = 1 OR status = 'untested')
@@ -434,7 +434,7 @@ class D1Database(Database):
     def get_nodes_for_testing(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
         if region == "global":
             sql = """
-            SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count
+            SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
             FROM nodes
             WHERE status IN ('untested', 'active') OR global_is_active IS NULL
             ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
@@ -444,7 +444,7 @@ class D1Database(Database):
             """
         else:
             sql = """
-            SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count
+            SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
             FROM nodes
             WHERE (global_is_active = 1 OR global_is_active IS NULL)
               AND (cn_is_active IS NULL OR cn_is_active = 1 OR status = 'untested')

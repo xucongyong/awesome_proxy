@@ -34,6 +34,31 @@ class TestTester(unittest.TestCase):
         self.assertEqual(cfg["inbounds"][0]["listen_port"], 20899)
         self.assertEqual(cfg["outbounds"][0]["tag"], "proxy")
 
+    def test_node_tester_all_nodes(self):
+        import tempfile
+        from unittest.mock import patch
+        from database import SQLiteDatabase
+        from tester import NodeTester
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            db = SQLiteDatabase(tmp.name)
+            db.init_db()
+            db.insert_nodes_batch([
+                "vless://u1@example1.com:443",
+                "trojan://u2@example2.com:443",
+            ])
+            tester = NodeTester(db=db, concurrency=2)
+
+            with patch("tester.test_single_node") as mock_test:
+                mock_test.side_effect = [
+                    (1, "active", 100, 10.0, 0),
+                    (2, "dead", -1, 0.0, 3),
+                ]
+                stats = tester.run(enable_speed_test=False, region="cn", all_nodes=True)
+                self.assertEqual(stats["tested"], 2)
+                self.assertEqual(stats["active"], 1)
+                self.assertEqual(stats["dead"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
