@@ -6,7 +6,7 @@ import socket
 import subprocess
 import tempfile
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from config import (
