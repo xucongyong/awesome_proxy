@@ -2,7 +2,7 @@ import json
 import logging
 import sqlite3
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from config import (
