@@ -242,14 +242,6 @@ def test_nodes_batch_singbox_clash(
         server_port = outbound_cfg.get("server_port")
         proto_type = outbound_cfg.get("type", "")
 
-        # Optional fast TCP precheck
-        if FAST_TCP_PRECHECK and proto_type not in ("hysteria2", "tuic") and server and server_port:
-            if not check_tcp_reachable(server, server_port, timeout=TCP_PING_TIMEOUT):
-                new_fail = current_fail + 1
-                new_status = "dead" if new_fail >= MAX_FAIL_COUNT else "untested"
-                results.append((node_id, new_status, -1, 0.0, new_fail))
-                continue
-
         valid_outbounds.append(outbound_cfg)
         testable_nodes[tag] = node
 
@@ -303,6 +295,9 @@ def test_nodes_batch_singbox_clash(
         # Concurrently query each outbound's delay via Clash API
         session = requests.Session()
         timeout_ms = int(timeout_sec * 1000)
+        total_items = len(testable_nodes)
+        done_count = 0
+        active_count = 0
 
         def query_delay(item: Tuple[str, Dict[str, Any]]) -> Tuple[int, str, int, float, int]:
             tag, n = item
@@ -310,7 +305,7 @@ def test_nodes_batch_singbox_clash(
             cf = n.get("fail_count", 0)
             try:
                 url = f"http://127.0.0.1:{clash_port}/proxies/{tag}/delay?url={test_url}&timeout={timeout_ms}"
-                resp = session.get(url, timeout=timeout_sec + 1.0)
+                resp = session.get(url, timeout=timeout_sec + 0.8)
                 if resp.status_code == 200:
                     delay = resp.json().get("delay", -1)
                     if delay > 0:
@@ -323,8 +318,17 @@ def test_nodes_batch_singbox_clash(
             ns = "dead" if nf >= MAX_FAIL_COUNT else "untested"
             return (nid, ns, -1, 0.0, nf)
 
+        batch_tested = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            batch_tested = list(executor.map(query_delay, testable_nodes.items()))
+            futures = {executor.submit(query_delay, item): item for item in testable_nodes.items()}
+            for f in as_completed(futures):
+                res = f.result()
+                batch_tested.append(res)
+                done_count += 1
+                if res[1] == "active":
+                    active_count += 1
+                if done_count % 100 == 0 or done_count == total_items:
+                    logger.info(f"  -> Batch progress: {done_count}/{total_items} tested | {active_count} active so far")
 
         results.extend(batch_tested)
         return results
@@ -412,7 +416,7 @@ class NodeTester:
                 f"Starting FULL test on all candidate nodes (region={region}) with concurrency={self.concurrency}"
             )
             total_stats = {"tested": 0, "active": 0, "dead": 0}
-            batch_size = max(self.concurrency * 10, 500)
+            batch_size = min(max(self.concurrency * 5, 200), 500)
 
             logger.info(f"Loading candidate nodes in a single read to minimize database queries...")
             all_candidates = self.db.get_nodes_for_testing(limit=15000, region=region)
