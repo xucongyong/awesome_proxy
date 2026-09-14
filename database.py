@@ -364,7 +364,6 @@ class PostgresDatabase(Database):
     def __init__(self, conn_str: str, schema: str = "proxy"):
         self.conn_str = conn_str
         self.schema = schema or "proxy"
-        self._init_tables()
 
     def _get_connection(self):
         # 1. Try standard psycopg2 driver
@@ -372,15 +371,6 @@ class PostgresDatabase(Database):
             import psycopg2
             conn = psycopg2.connect(self.conn_str)
             conn.autocommit = True
-            cur = conn.cursor()
-            try:
-                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema};")
-                cur.execute(f"SET search_path TO {self.schema}, public;")
-            finally:
-                try:
-                    cur.close()
-                except Exception:
-                    pass
             return conn
         except ImportError:
             pass
@@ -397,15 +387,6 @@ class PostgresDatabase(Database):
                 database=u.path.lstrip("/") or "postgres",
             )
             conn.autocommit = True
-            cur = conn.cursor()
-            try:
-                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema};")
-                cur.execute(f"SET search_path TO {self.schema}, public;")
-            finally:
-                try:
-                    cur.close()
-                except Exception:
-                    pass
             return conn
         except ImportError:
             raise RuntimeError(
@@ -438,12 +419,10 @@ class PostgresDatabase(Database):
         cols = [col[0] for col in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    def _init_tables(self) -> None:
-        self.init_db()
-
     def init_db(self) -> None:
         with self._get_cursor() as cur:
             cur.execute(f"""
+            CREATE SCHEMA IF NOT EXISTS {self.schema};
             CREATE TABLE IF NOT EXISTS {self.schema}.nodes (
                 id SERIAL PRIMARY KEY,
                 node_url TEXT NOT NULL,
@@ -471,32 +450,18 @@ class PostgresDatabase(Database):
                 nodes_added INTEGER DEFAULT 0,
                 fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            ALTER TABLE {self.schema}.nodes ADD COLUMN IF NOT EXISTS node_hash VARCHAR(64);
+            CREATE INDEX IF NOT EXISTS idx_nodes_status ON {self.schema}.nodes(status);
+            CREATE INDEX IF NOT EXISTS idx_nodes_delay ON {self.schema}.nodes(delay_ms);
+            CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON {self.schema}.nodes(cn_is_active);
+            CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON {self.schema}.nodes(global_is_active);
+            CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON {self.schema}.nodes(cn_last_tested);
+            CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON {self.schema}.nodes(global_last_tested);
             """)
             try:
-                cur.execute(f"ALTER TABLE {self.schema}.nodes DROP CONSTRAINT IF EXISTS nodes_node_url_key;")
+                cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_hash ON {self.schema}.nodes (node_hash);")
             except Exception:
                 pass
-            try:
-                cur.execute(f"DROP INDEX IF EXISTS {self.schema}.idx_nodes_node_url_hash;")
-            except Exception:
-                pass
-            cur.execute(f"ALTER TABLE {self.schema}.nodes ADD COLUMN IF NOT EXISTS node_hash VARCHAR(64);")
-
-            # Backfill node_hash for existing rows if needed
-            cur.execute(f"SELECT id, node_url FROM {self.schema}.nodes WHERE node_hash IS NULL LIMIT 20000;")
-            null_rows = cur.fetchall()
-            if null_rows:
-                for nid, nurl in null_rows:
-                    nh = hashlib.sha256(nurl.encode('utf-8')).hexdigest()
-                    cur.execute(f"UPDATE {self.schema}.nodes SET node_hash = %s WHERE id = %s;", (nh, nid))
-
-            cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_hash ON {self.schema}.nodes (node_hash);")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_status ON {self.schema}.nodes(status);")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_delay ON {self.schema}.nodes(delay_ms);")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON {self.schema}.nodes(cn_is_active);")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON {self.schema}.nodes(global_is_active);")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON {self.schema}.nodes(cn_last_tested);")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON {self.schema}.nodes(global_last_tested);")
 
     def get_last_pushed_date(self) -> Optional[str]:
         with self._get_cursor() as cur:
