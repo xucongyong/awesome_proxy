@@ -39,3 +39,5 @@ temp_*.json
 *.swp
 nodes_backup.json
 postgres_nodes.sql
+node_modules/
+.wrangler/
