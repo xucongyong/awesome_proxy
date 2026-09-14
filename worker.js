@@ -21,6 +21,8 @@ export default {
         return await handleSingboxJson(request, env, ctx);
       } else if (path === "/api/stats") {
         return await handleApiStats(request, env, ctx);
+      } else if (path === "/api/debug") {
+        return await handleDebug(request, env, ctx);
       } else {
         return await handleDashboard(request, env, ctx);
       }
@@ -43,8 +45,6 @@ async function dbQuery(env, ctx, sql, params = []) {
     const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
     await client.connect();
     try {
-      // Set schema search_path so it resolves proxy.nodes first, then public.nodes
-      await client.query("SET search_path TO proxy, public;");
       const res = await client.query(sql, params);
       return res.rows;
     } finally {
@@ -63,6 +63,21 @@ async function dbQuery(env, ctx, sql, params = []) {
   return [];
 }
 
+async function handleDebug(request, env, ctx) {
+  if (!env.HYPERDRIVE) return new Response(JSON.stringify({ error: "No HYPERDRIVE" }), { headers: { "Content-Type": "application/json" } });
+  const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
+  await client.connect();
+  try {
+    const meta = await client.query(`SELECT current_database() as database, current_user as user, current_schema as schema;`);
+    const tables = await client.query(`SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema');`);
+    return new Response(JSON.stringify({ meta: meta.rows[0], tables: tables.rows }, null, 2), { headers: { "Content-Type": "application/json" } });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message }), { headers: { "Content-Type": "application/json" } });
+  } finally {
+    ctx.waitUntil(client.end());
+  }
+}
+
 /**
  * 1. Base64 订阅分发接口 (/sub) - 带边缘缓存保护
  */
@@ -75,7 +90,7 @@ async function handleSubscription(request, env, ctx) {
   try {
     const sql = `
       SELECT node_url
-      FROM nodes
+      FROM proxy.nodes
       WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
         AND COALESCE(cn_delay_ms, delay_ms) > 0
       ORDER BY COALESCE(cn_delay_ms, delay_ms) ASC, speed_mbps DESC
@@ -109,11 +124,11 @@ async function handleApiStats(request, env, ctx) {
   try {
     const statsQuery = `
       SELECT
-        (SELECT COUNT(*) FROM nodes) AS total,
-        (SELECT COUNT(*) FROM nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS cn_active,
-        (SELECT COUNT(*) FROM nodes WHERE global_is_active = 1) AS global_active,
-        (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead,
-        (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested;
+        (SELECT COUNT(*) FROM proxy.nodes) AS total,
+        (SELECT COUNT(*) FROM proxy.nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS cn_active,
+        (SELECT COUNT(*) FROM proxy.nodes WHERE global_is_active = 1) AS global_active,
+        (SELECT COUNT(*) FROM proxy.nodes WHERE status = 'dead') AS dead,
+        (SELECT COUNT(*) FROM proxy.nodes WHERE status = 'untested') AS untested;
     `;
     const rows = await dbQuery(env, ctx, statsQuery);
     const statRow = rows[0] || {};
@@ -147,7 +162,7 @@ async function handleSingboxJson(request, env, ctx) {
   try {
     const sql = `
       SELECT id, node_url, protocol, COALESCE(cn_delay_ms, delay_ms) as delay_ms, speed_mbps
-      FROM nodes
+      FROM proxy.nodes
       WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
         AND COALESCE(cn_delay_ms, delay_ms) > 0
       ORDER BY delay_ms ASC, speed_mbps DESC
@@ -266,11 +281,11 @@ async function handleDashboard(request, env, ctx) {
   try {
     const statsSql = `
       SELECT
-        (SELECT COUNT(*) FROM nodes) AS total,
-        (SELECT COUNT(*) FROM nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS cn_active,
-        (SELECT COUNT(*) FROM nodes WHERE global_is_active = 1) AS global_active,
-        (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead,
-        (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested;
+        (SELECT COUNT(*) FROM proxy.nodes) AS total,
+        (SELECT COUNT(*) FROM proxy.nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS cn_active,
+        (SELECT COUNT(*) FROM proxy.nodes WHERE global_is_active = 1) AS global_active,
+        (SELECT COUNT(*) FROM proxy.nodes WHERE status = 'dead') AS dead,
+        (SELECT COUNT(*) FROM proxy.nodes WHERE status = 'untested') AS untested;
     `;
     const rows = await dbQuery(env, ctx, statsSql);
     if (rows && rows[0]) {
@@ -291,7 +306,7 @@ async function handleDashboard(request, env, ctx) {
       SELECT id, protocol, node_url,
              COALESCE(cn_delay_ms, delay_ms) AS delay_ms,
              speed_mbps, last_tested
-      FROM nodes
+      FROM proxy.nodes
       WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
         AND COALESCE(cn_delay_ms, delay_ms) > 0
       ORDER BY delay_ms ASC, speed_mbps DESC
