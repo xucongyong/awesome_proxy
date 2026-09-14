@@ -136,6 +136,7 @@ class SQLiteDatabase(Database):
                 """
             )
             for col_def in [
+                ("source_url", "TEXT"),
                 ("cn_delay_ms", "INTEGER DEFAULT -1"),
                 ("cn_is_active", "INTEGER DEFAULT NULL"),
                 ("cn_last_tested", "TIMESTAMP"),
