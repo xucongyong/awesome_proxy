@@ -424,13 +424,17 @@ class NodeTester:
                 logger.info(f"No candidate nodes available for testing in region '{region}'.")
                 return total_stats
 
-            # Prioritize untested nodes first, then active/retest nodes
-            untested = [
-                n for n in all_candidates
-                if (region == "global" and n.get("global_is_active") is None)
-                or (region == "cn" and n.get("cn_is_active") is None)
-            ]
-            candidates = untested if untested else all_candidates
+            # If all_nodes is True, test all candidate nodes; otherwise prioritize untested
+            if all_nodes:
+                candidates = all_candidates
+            else:
+                untested = [
+                    n for n in all_candidates
+                    if n.get("status") == "untested"
+                    or (region == "global" and n.get("global_is_active") is None)
+                    or (region == "cn" and n.get("cn_is_active") is None)
+                ]
+                candidates = untested if untested else all_candidates
 
             total_count = len(candidates)
             total_batches = (total_count + batch_size - 1) // batch_size

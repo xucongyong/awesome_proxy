@@ -507,8 +507,10 @@ class PostgresDatabase(Database):
                 sql = f"""
                     SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
                     FROM {self.schema}.nodes
-                    WHERE status IN ('untested', 'active') OR global_is_active IS NULL
-                    ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
+                    WHERE (status IN ('untested', 'active') OR global_is_active IS NULL)
+                      AND status != 'dead'
+                    ORDER BY CASE WHEN status = 'untested' THEN 0 ELSE 1 END,
+                             CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
                              CASE WHEN global_is_active IS NULL THEN id END DESC,
                              global_last_tested ASC NULLS FIRST
                     LIMIT %s;
@@ -517,9 +519,10 @@ class PostgresDatabase(Database):
                 sql = f"""
                     SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
                     FROM {self.schema}.nodes
-                    WHERE (global_is_active = 1 OR status = 'active' OR cn_is_active IS NULL)
+                    WHERE (status = 'untested' OR status = 'active' OR cn_is_active IS NULL OR cn_is_active = 1)
                       AND status != 'dead'
-                    ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
+                    ORDER BY CASE WHEN status = 'untested' THEN 0 ELSE 1 END,
+                             CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
                              CASE WHEN cn_is_active IS NULL THEN id END DESC,
                              cn_last_tested ASC NULLS FIRST
                     LIMIT %s;
