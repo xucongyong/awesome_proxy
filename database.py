@@ -2,6 +2,7 @@ import json
 import logging
 import sqlite3
 import urllib.parse
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 import requests
 
@@ -370,9 +371,15 @@ class PostgresDatabase(Database):
             import psycopg2
             conn = psycopg2.connect(self.conn_str)
             conn.autocommit = True
-            with conn.cursor() as cur:
+            cur = conn.cursor()
+            try:
                 cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema};")
                 cur.execute(f"SET search_path TO {self.schema}, public;")
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
             return conn
         except ImportError:
             pass
@@ -389,9 +396,15 @@ class PostgresDatabase(Database):
                 database=u.path.lstrip("/") or "postgres",
             )
             conn.autocommit = True
-            with conn.cursor() as cur:
+            cur = conn.cursor()
+            try:
                 cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema};")
                 cur.execute(f"SET search_path TO {self.schema}, public;")
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
             return conn
         except ImportError:
             raise RuntimeError(
@@ -401,6 +414,22 @@ class PostgresDatabase(Database):
                 "or:\n"
                 "  opkg update && opkg install python3-psycopg2"
             )
+
+    @contextmanager
+    def _get_cursor(self):
+        conn = self._get_connection()
+        cur = conn.cursor()
+        try:
+            yield cur
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _fetch_dicts(self, cur) -> List[Dict[str, Any]]:
         if not cur.description:
@@ -412,114 +441,109 @@ class PostgresDatabase(Database):
         self.init_db()
 
     def init_db(self) -> None:
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {self.schema}.nodes (
-                    id SERIAL PRIMARY KEY,
-                    node_url TEXT NOT NULL,
-                    protocol VARCHAR(32) NOT NULL,
-                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_tested TIMESTAMP,
-                    status VARCHAR(32) DEFAULT 'untested',
-                    is_active INTEGER DEFAULT NULL,
-                    source_url TEXT,
-                    delay_ms INTEGER DEFAULT -1,
-                    speed_mbps REAL DEFAULT 0.0,
-                    fail_count INTEGER DEFAULT 0,
-                    cn_delay_ms INTEGER DEFAULT -1,
-                    cn_is_active INTEGER DEFAULT NULL,
-                    cn_last_tested TIMESTAMP,
-                    global_delay_ms INTEGER DEFAULT -1,
-                    global_is_active INTEGER DEFAULT NULL,
-                    global_last_tested TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS {self.schema}.fetch_logs (
-                    id SERIAL PRIMARY KEY,
-                    last_pushed_date TEXT NOT NULL,
-                    nodes_found INTEGER DEFAULT 0,
-                    nodes_added INTEGER DEFAULT 0,
-                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                try:
-                    cur.execute(f"ALTER TABLE {self.schema}.nodes DROP CONSTRAINT IF EXISTS nodes_node_url_key;")
-                except Exception:
-                    pass
-                cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_url_hash ON {self.schema}.nodes (md5(node_url));")
-                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_status ON {self.schema}.nodes(status);")
-                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_delay ON {self.schema}.nodes(delay_ms);")
-                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON {self.schema}.nodes(cn_is_active);")
-                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON {self.schema}.nodes(global_is_active);")
-                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON {self.schema}.nodes(cn_last_tested);")
-                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON {self.schema}.nodes(global_last_tested);")
+        with self._get_cursor() as cur:
+            cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.schema}.nodes (
+                id SERIAL PRIMARY KEY,
+                node_url TEXT NOT NULL,
+                protocol VARCHAR(32) NOT NULL,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_tested TIMESTAMP,
+                status VARCHAR(32) DEFAULT 'untested',
+                is_active INTEGER DEFAULT NULL,
+                source_url TEXT,
+                delay_ms INTEGER DEFAULT -1,
+                speed_mbps REAL DEFAULT 0.0,
+                fail_count INTEGER DEFAULT 0,
+                cn_delay_ms INTEGER DEFAULT -1,
+                cn_is_active INTEGER DEFAULT NULL,
+                cn_last_tested TIMESTAMP,
+                global_delay_ms INTEGER DEFAULT -1,
+                global_is_active INTEGER DEFAULT NULL,
+                global_last_tested TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS {self.schema}.fetch_logs (
+                id SERIAL PRIMARY KEY,
+                last_pushed_date TEXT NOT NULL,
+                nodes_found INTEGER DEFAULT 0,
+                nodes_added INTEGER DEFAULT 0,
+                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            try:
+                cur.execute(f"ALTER TABLE {self.schema}.nodes DROP CONSTRAINT IF EXISTS nodes_node_url_key;")
+            except Exception:
+                pass
+            cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_url_hash ON {self.schema}.nodes (md5(node_url));")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_status ON {self.schema}.nodes(status);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_delay ON {self.schema}.nodes(delay_ms);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON {self.schema}.nodes(cn_is_active);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON {self.schema}.nodes(global_is_active);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON {self.schema}.nodes(cn_last_tested);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON {self.schema}.nodes(global_last_tested);")
 
     def get_last_pushed_date(self) -> Optional[str]:
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT last_pushed_date FROM {self.schema}.fetch_logs ORDER BY id DESC LIMIT 1;")
-                row = cur.fetchone()
-                return row[0] if row else None
+        with self._get_cursor() as cur:
+            cur.execute(f"SELECT last_pushed_date FROM {self.schema}.fetch_logs ORDER BY id DESC LIMIT 1;")
+            row = cur.fetchone()
+            return row[0] if row else None
 
     def record_fetch_log(self, last_pushed_date: str, nodes_found: int, nodes_added: int) -> None:
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"INSERT INTO {self.schema}.fetch_logs (last_pushed_date, nodes_found, nodes_added) VALUES (%s, %s, %s);",
-                    (last_pushed_date, nodes_found, nodes_added),
-                )
+        with self._get_cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {self.schema}.fetch_logs (last_pushed_date, nodes_found, nodes_added) VALUES (%s, %s, %s);",
+                (last_pushed_date, nodes_found, nodes_added),
+            )
 
     def insert_nodes_batch(self, node_urls: Any, source_url: Optional[str] = None) -> int:
         if not node_urls:
             return 0
         added = 0
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                for item in node_urls:
-                    if isinstance(item, tuple):
-                        url, src = item[0], item[1] or source_url
-                    else:
-                        url, src = item, source_url
-                    proto = extract_protocol(url)
-                    cur.execute(
-                        f"""
-                        INSERT INTO {self.schema}.nodes (node_url, protocol, source_url)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT ((md5(node_url))) DO UPDATE SET source_url = COALESCE({self.schema}.nodes.source_url, EXCLUDED.source_url)
-                        WHERE {self.schema}.nodes.source_url IS NULL AND EXCLUDED.source_url IS NOT NULL;
-                        """,
-                        (url, proto, src),
-                    )
-                    if cur.rowcount > 0:
-                        added += 1
+        with self._get_cursor() as cur:
+            for item in node_urls:
+                if isinstance(item, tuple):
+                    url, src = item[0], item[1] or source_url
+                else:
+                    url, src = item, source_url
+                proto = extract_protocol(url)
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.schema}.nodes (node_url, protocol, source_url)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT ((md5(node_url))) DO UPDATE SET source_url = COALESCE({self.schema}.nodes.source_url, EXCLUDED.source_url)
+                    WHERE {self.schema}.nodes.source_url IS NULL AND EXCLUDED.source_url IS NOT NULL;
+                    """,
+                    (url, proto, src),
+                )
+                if cur.rowcount > 0:
+                    added += 1
         return added
 
     def get_nodes_for_testing(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                if region == "global":
-                    sql = f"""
-                        SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
-                        FROM {self.schema}.nodes
-                        WHERE status IN ('untested', 'active') OR global_is_active IS NULL
-                        ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
-                                 CASE WHEN global_is_active IS NULL THEN id END DESC,
-                                 global_last_tested ASC NULLS FIRST
-                        LIMIT %s;
-                    """
-                else:
-                    sql = f"""
-                        SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
-                        FROM {self.schema}.nodes
-                        WHERE (global_is_active = 1 OR status = 'active' OR cn_is_active IS NULL)
-                          AND status != 'dead'
-                        ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
-                                 CASE WHEN cn_is_active IS NULL THEN id END DESC,
-                                 cn_last_tested ASC NULLS FIRST
-                        LIMIT %s;
-                    """
-                cur.execute(sql, (limit,))
-                return self._fetch_dicts(cur)
+        with self._get_cursor() as cur:
+            if region == "global":
+                sql = f"""
+                    SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
+                    FROM {self.schema}.nodes
+                    WHERE status IN ('untested', 'active') OR global_is_active IS NULL
+                    ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
+                             CASE WHEN global_is_active IS NULL THEN id END DESC,
+                             global_last_tested ASC NULLS FIRST
+                    LIMIT %s;
+                """
+            else:
+                sql = f"""
+                    SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
+                    FROM {self.schema}.nodes
+                    WHERE (global_is_active = 1 OR status = 'active' OR cn_is_active IS NULL)
+                      AND status != 'dead'
+                    ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
+                             CASE WHEN cn_is_active IS NULL THEN id END DESC,
+                             cn_last_tested ASC NULLS FIRST
+                    LIMIT %s;
+                """
+            cur.execute(sql, (limit,))
+            return self._fetch_dicts(cur)
 
     def update_test_result(
         self,
@@ -530,11 +554,94 @@ class PostgresDatabase(Database):
         fail_count: int,
         region: str = "cn",
     ) -> None:
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
+        with self._get_cursor() as cur:
+            if region == "global":
+                cur.execute(
+                    f"""
+                    UPDATE {self.schema}.nodes
+                    SET status = %s,
+                        delay_ms = %s,
+                        speed_mbps = %s,
+                        fail_count = %s,
+                        last_tested = CURRENT_TIMESTAMP,
+                        is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                        global_delay_ms = %s,
+                        global_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                        global_last_tested = CURRENT_TIMESTAMP
+                    WHERE id = %s;
+                    """,
+                    (status, delay_ms, speed_mbps, fail_count, status, delay_ms, status, node_id),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    UPDATE {self.schema}.nodes
+                    SET status = %s,
+                        delay_ms = %s,
+                        speed_mbps = %s,
+                        fail_count = %s,
+                        last_tested = CURRENT_TIMESTAMP,
+                        is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                        cn_delay_ms = %s,
+                        cn_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                        cn_last_tested = CURRENT_TIMESTAMP
+                    WHERE id = %s;
+                    """,
+                    (status, delay_ms, speed_mbps, fail_count, status, delay_ms, status, node_id),
+                )
+
+    def update_test_results_batch(
+        self,
+        results: List[Tuple[int, str, int, float, int]],
+        region: str = "cn",
+    ) -> None:
+        if not results:
+            return
+        with self._get_cursor() as cur:
+            # Fast bulk update with psycopg2.extras.execute_values if available
+            has_execute_values = False
+            try:
+                import psycopg2.extras
+                has_execute_values = hasattr(psycopg2.extras, "execute_values")
+            except ImportError:
+                pass
+
+            if has_execute_values:
                 if region == "global":
-                    cur.execute(
-                        f"""
+                    sql = f"""
+                        UPDATE {self.schema}.nodes
+                        SET status = data.status,
+                            delay_ms = data.delay_ms,
+                            speed_mbps = data.speed_mbps,
+                            fail_count = data.fail_count,
+                            last_tested = CURRENT_TIMESTAMP,
+                            is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                            global_delay_ms = data.delay_ms,
+                            global_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                            global_last_tested = CURRENT_TIMESTAMP
+                        FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
+                        WHERE {self.schema}.nodes.id = data.id;
+                    """
+                else:
+                    sql = f"""
+                        UPDATE {self.schema}.nodes
+                        SET status = data.status,
+                            delay_ms = data.delay_ms,
+                            speed_mbps = data.speed_mbps,
+                            fail_count = data.fail_count,
+                            last_tested = CURRENT_TIMESTAMP,
+                            is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                            cn_delay_ms = data.delay_ms,
+                            cn_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                            cn_last_tested = CURRENT_TIMESTAMP
+                        FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
+                        WHERE {self.schema}.nodes.id = data.id;
+                    """
+                psycopg2.extras.execute_values(cur, sql, results, template="(%s, %s, %s, %s, %s)")
+            else:
+                # Universal executemany execution (works on pg8000 and any DB-API 2.0 driver)
+                if region == "global":
+                    sql = f"""
                         UPDATE {self.schema}.nodes
                         SET status = %s,
                             delay_ms = %s,
@@ -546,12 +653,9 @@ class PostgresDatabase(Database):
                             global_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
                             global_last_tested = CURRENT_TIMESTAMP
                         WHERE id = %s;
-                        """,
-                        (status, delay_ms, speed_mbps, fail_count, status, delay_ms, status, node_id),
-                    )
+                    """
                 else:
-                    cur.execute(
-                        f"""
+                    sql = f"""
                         UPDATE {self.schema}.nodes
                         SET status = %s,
                             delay_ms = %s,
@@ -563,151 +667,66 @@ class PostgresDatabase(Database):
                             cn_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
                             cn_last_tested = CURRENT_TIMESTAMP
                         WHERE id = %s;
-                        """,
-                        (status, delay_ms, speed_mbps, fail_count, status, delay_ms, status, node_id),
-                    )
-
-    def update_test_results_batch(
-        self,
-        results: List[Tuple[int, str, int, float, int]],
-        region: str = "cn",
-    ) -> None:
-        if not results:
-            return
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                # Fast bulk update with psycopg2.extras.execute_values if available
-                has_execute_values = False
-                try:
-                    import psycopg2.extras
-                    has_execute_values = hasattr(psycopg2.extras, "execute_values")
-                except ImportError:
-                    pass
-
-                if has_execute_values:
-                    if region == "global":
-                        sql = f"""
-                            UPDATE {self.schema}.nodes
-                            SET status = data.status,
-                                delay_ms = data.delay_ms,
-                                speed_mbps = data.speed_mbps,
-                                fail_count = data.fail_count,
-                                last_tested = CURRENT_TIMESTAMP,
-                                is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
-                                global_delay_ms = data.delay_ms,
-                                global_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
-                                global_last_tested = CURRENT_TIMESTAMP
-                            FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
-                            WHERE {self.schema}.nodes.id = data.id;
-                        """
-                    else:
-                        sql = f"""
-                            UPDATE {self.schema}.nodes
-                            SET status = data.status,
-                                delay_ms = data.delay_ms,
-                                speed_mbps = data.speed_mbps,
-                                fail_count = data.fail_count,
-                                last_tested = CURRENT_TIMESTAMP,
-                                is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
-                                cn_delay_ms = data.delay_ms,
-                                cn_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
-                                cn_last_tested = CURRENT_TIMESTAMP
-                            FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
-                            WHERE {self.schema}.nodes.id = data.id;
-                        """
-                    psycopg2.extras.execute_values(cur, sql, results, template="(%s, %s, %s, %s, %s)")
-                else:
-                    # Universal executemany execution (works on pg8000 and any DB-API 2.0 driver)
-                    if region == "global":
-                        sql = f"""
-                            UPDATE {self.schema}.nodes
-                            SET status = %s,
-                                delay_ms = %s,
-                                speed_mbps = %s,
-                                fail_count = %s,
-                                last_tested = CURRENT_TIMESTAMP,
-                                is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
-                                global_delay_ms = %s,
-                                global_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
-                                global_last_tested = CURRENT_TIMESTAMP
-                            WHERE id = %s;
-                        """
-                    else:
-                        sql = f"""
-                            UPDATE {self.schema}.nodes
-                            SET status = %s,
-                                delay_ms = %s,
-                                speed_mbps = %s,
-                                fail_count = %s,
-                                last_tested = CURRENT_TIMESTAMP,
-                                is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
-                                cn_delay_ms = %s,
-                                cn_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
-                                cn_last_tested = CURRENT_TIMESTAMP
-                            WHERE id = %s;
-                        """
-                    params = [
-                        (st, dl, sp, fc, st, dl, st, nid)
-                        for nid, st, dl, sp, fc in results
-                    ]
-                    cur.executemany(sql, params)
+                    """
+                params = [
+                    (st, dl, sp, fc, st, dl, st, nid)
+                    for nid, st, dl, sp, fc in results
+                ]
+                cur.executemany(sql, params)
 
     def get_active_nodes(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                if region == "global":
-                    sql = f"""
-                        SELECT id, node_url, protocol,
-                               COALESCE(global_delay_ms, delay_ms) AS delay_ms,
-                               speed_mbps, fail_count,
-                               COALESCE(global_last_tested, last_tested) AS last_tested,
-                               global_is_active AS is_active
-                        FROM {self.schema}.nodes
-                        WHERE global_is_active = 1
-                        ORDER BY COALESCE(global_delay_ms, delay_ms) ASC, speed_mbps DESC
-                        LIMIT %s;
-                    """
-                else:
-                    sql = f"""
-                        SELECT id, node_url, protocol,
-                               COALESCE(cn_delay_ms, delay_ms) AS delay_ms,
-                               speed_mbps, fail_count,
-                               COALESCE(cn_last_tested, last_tested) AS last_tested,
-                               cn_is_active AS is_active
-                        FROM {self.schema}.nodes
-                        WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
-                          AND COALESCE(cn_delay_ms, delay_ms) > 0
-                        ORDER BY COALESCE(cn_delay_ms, delay_ms) ASC, speed_mbps DESC
-                        LIMIT %s;
-                    """
-                cur.execute(sql, (limit,))
-                return self._fetch_dicts(cur)
+        with self._get_cursor() as cur:
+            if region == "global":
+                sql = f"""
+                    SELECT id, node_url, protocol,
+                           COALESCE(global_delay_ms, delay_ms) AS delay_ms,
+                           speed_mbps, fail_count,
+                           COALESCE(global_last_tested, last_tested) AS last_tested,
+                           global_is_active AS is_active
+                    FROM {self.schema}.nodes
+                    WHERE global_is_active = 1
+                    ORDER BY COALESCE(global_delay_ms, delay_ms) ASC, speed_mbps DESC
+                    LIMIT %s;
+                """
+            else:
+                sql = f"""
+                    SELECT id, node_url, protocol,
+                           COALESCE(cn_delay_ms, delay_ms) AS delay_ms,
+                           speed_mbps, fail_count,
+                           COALESCE(cn_last_tested, last_tested) AS last_tested,
+                           cn_is_active AS is_active
+                    FROM {self.schema}.nodes
+                    WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
+                      AND COALESCE(cn_delay_ms, delay_ms) > 0
+                    ORDER BY COALESCE(cn_delay_ms, delay_ms) ASC, speed_mbps DESC
+                    LIMIT %s;
+                """
+            cur.execute(sql, (limit,))
+            return self._fetch_dicts(cur)
 
     def get_stats(self) -> Dict[str, Any]:
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(f"""
-                    SELECT
-                        (SELECT COUNT(*) FROM {self.schema}.nodes) AS total,
-                        (SELECT COUNT(*) FROM {self.schema}.nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS active,
-                        (SELECT COUNT(*) FROM {self.schema}.nodes WHERE status = 'untested') AS untested,
-                        (SELECT COUNT(*) FROM {self.schema}.nodes WHERE status = 'dead') AS dead;
-                """)
-                row = cur.fetchone()
-                return {
-                    "total": row[0] if row else 0,
-                    "active": row[1] if row else 0,
-                    "untested": row[2] if row else 0,
-                    "dead": row[3] if row else 0,
-                }
+        with self._get_cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    (SELECT COUNT(*) FROM {self.schema}.nodes) AS total,
+                    (SELECT COUNT(*) FROM {self.schema}.nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS active,
+                    (SELECT COUNT(*) FROM {self.schema}.nodes WHERE status = 'untested') AS untested,
+                    (SELECT COUNT(*) FROM {self.schema}.nodes WHERE status = 'dead') AS dead;
+            """)
+            row = cur.fetchone()
+            return {
+                "total": row[0] if row else 0,
+                "active": row[1] if row else 0,
+                "untested": row[2] if row else 0,
+                "dead": row[3] if row else 0,
+            }
 
     def clean_dead_nodes(self, days: int = 30) -> int:
-        with self._get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"DELETE FROM {self.schema}.nodes WHERE status = 'dead' AND fail_count >= 3 AND last_tested < NOW() - INTERVAL '{days} days';"
-                )
-                return cur.rowcount
+        with self._get_cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {self.schema}.nodes WHERE status = 'dead' AND fail_count >= 3 AND last_tested < NOW() - INTERVAL '{days} days';"
+            )
+            return cur.rowcount
 
 
 
