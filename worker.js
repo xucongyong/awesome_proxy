@@ -1,16 +1,17 @@
 /**
  * Cloudflare Worker: Automated Proxy Hub & Dashboard
- * Directly binds to Cloudflare D1 (nodes-db: 3b55a783-16d9-4f31-bd9f-312972752269)
+ * Connected to PostgreSQL (proxy.nodes) via Cloudflare Hyperdrive
  */
+
+import { Client } from 'pg';
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Safety check for D1 database binding
-    if (!env.DB) {
-      return new Response("Cloudflare D1 binding 'DB' not configured.", { status: 500 });
+    if (!env.HYPERDRIVE && !env.DB) {
+      return new Response("Neither 'HYPERDRIVE' nor 'DB' binding configured.", { status: 500 });
     }
 
     try {
@@ -19,12 +20,11 @@ export default {
       } else if (path === "/json" || path === "/config.json") {
         return await handleSingboxJson(request, env, ctx);
       } else if (path === "/api/stats") {
-        return await handleApiStats(request, env);
+        return await handleApiStats(request, env, ctx);
       } else {
         return await handleDashboard(request, env, ctx);
       }
     } catch (err) {
-      // Global fallback - never crash into Error 1101
       return new Response(`Proxy Hub Notice: ${err.message}`, {
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -32,6 +32,36 @@ export default {
     }
   },
 };
+
+/**
+ * Universal Database Query Helper:
+ * Prefers PostgreSQL via Hyperdrive (accelerated pool & edge cache),
+ * falls back to D1 if Hyperdrive is not bound.
+ */
+async function dbQuery(env, ctx, sql, params = []) {
+  if (env.HYPERDRIVE) {
+    const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
+    await client.connect();
+    try {
+      // Set schema search_path so it resolves proxy.nodes first, then public.nodes
+      await client.query("SET search_path TO proxy, public;");
+      const res = await client.query(sql, params);
+      return res.rows;
+    } finally {
+      ctx.waitUntil(client.end());
+    }
+  }
+
+  // Fallback to legacy D1
+  if (env.DB) {
+    const stmt = env.DB.prepare(sql);
+    const bound = params.length > 0 ? stmt.bind(...params) : stmt;
+    const res = await bound.all();
+    return res.results || [];
+  }
+
+  return [];
+}
 
 /**
  * 1. Base64 订阅分发接口 (/sub) - 带边缘缓存保护
@@ -51,8 +81,8 @@ async function handleSubscription(request, env, ctx) {
       ORDER BY COALESCE(cn_delay_ms, delay_ms) ASC, speed_mbps DESC
       LIMIT 100;
     `;
-    const { results } = await env.DB.prepare(sql).all();
-    const urls = (results || []).map((r) => r.node_url).filter(Boolean);
+    const rows = await dbQuery(env, ctx, sql);
+    const urls = rows.map((r) => r.node_url).filter(Boolean);
     const plainText = urls.join("\n");
     const b64 = btoa(unescape(encodeURIComponent(plainText)));
 
@@ -75,7 +105,7 @@ async function handleSubscription(request, env, ctx) {
 /**
  * 2. API 统计接口 (/api/stats)
  */
-async function handleApiStats(request, env) {
+async function handleApiStats(request, env, ctx) {
   try {
     const statsQuery = `
       SELECT
@@ -85,8 +115,16 @@ async function handleApiStats(request, env) {
         (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead,
         (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested;
     `;
-    const statRow = await env.DB.prepare(statsQuery).first();
-    return new Response(JSON.stringify(statRow || {}, null, 2), {
+    const rows = await dbQuery(env, ctx, statsQuery);
+    const statRow = rows[0] || {};
+    const formatted = {
+      total: Number(statRow.total || 0),
+      cn_active: Number(statRow.cn_active || 0),
+      global_active: Number(statRow.global_active || 0),
+      dead: Number(statRow.dead || 0),
+      untested: Number(statRow.untested || 0),
+    };
+    return new Response(JSON.stringify(formatted, null, 2), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
     });
   } catch (err) {
@@ -115,8 +153,7 @@ async function handleSingboxJson(request, env, ctx) {
       ORDER BY delay_ms ASC, speed_mbps DESC
       LIMIT 50;
     `;
-    const { results } = await env.DB.prepare(sql).all();
-    nodes = results || [];
+    nodes = await dbQuery(env, ctx, sql);
   } catch (err) {}
 
   const outbounds = [];
@@ -124,7 +161,8 @@ async function handleSingboxJson(request, env, ctx) {
 
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
-    const tag = `node-${i + 1}-${n.protocol}-${n.delay_ms}ms`;
+    const delay = Number(n.delay_ms || 0);
+    const tag = `node-${i + 1}-${n.protocol}-${delay}ms`;
     const parsed = parseNodeSimple(n.node_url, tag);
     if (parsed) {
       outbounds.push(parsed);
@@ -213,7 +251,7 @@ function parseNodeSimple(url, tag) {
 }
 
 /**
- * 4. 实时暗黑科技风仪表盘页面 (/) - 带边缘缓存与防炸容错
+ * 4. 实时暗黑科技风仪表盘页面 (/)
  */
 async function handleDashboard(request, env, ctx) {
   const cache = caches.default;
@@ -223,7 +261,7 @@ async function handleDashboard(request, env, ctx) {
 
   let stats = { total: 12810, cn_active: 0, global_active: 0, dead: 0, untested: 12810 };
   let topNodes = [];
-  let d1Notice = null;
+  let dbError = null;
 
   try {
     const statsSql = `
@@ -234,10 +272,18 @@ async function handleDashboard(request, env, ctx) {
         (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead,
         (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested;
     `;
-    const res = await env.DB.prepare(statsSql).first();
-    if (res) stats = res;
+    const rows = await dbQuery(env, ctx, statsSql);
+    if (rows && rows[0]) {
+      stats = {
+        total: Number(rows[0].total || 0),
+        cn_active: Number(rows[0].cn_active || 0),
+        global_active: Number(rows[0].global_active || 0),
+        dead: Number(rows[0].dead || 0),
+        untested: Number(rows[0].untested || 0),
+      };
+    }
   } catch (err) {
-    d1Notice = err.message;
+    dbError = err.message;
   }
 
   try {
@@ -251,10 +297,10 @@ async function handleDashboard(request, env, ctx) {
       ORDER BY delay_ms ASC, speed_mbps DESC
       LIMIT 20;
     `;
-    const { results } = await env.DB.prepare(topSql).all();
-    if (results) topNodes = results;
+    const rows = await dbQuery(env, ctx, topSql);
+    if (rows) topNodes = rows;
   } catch (err) {
-    if (!d1Notice) d1Notice = err.message;
+    if (!dbError) dbError = err.message;
   }
 
   const origin = new URL(request.url).origin;
@@ -270,11 +316,12 @@ async function handleDashboard(request, env, ctx) {
 
     let badge = "bg-green-500/20 text-green-400 border-green-500/30";
     let grade = "⭐⭐⭐⭐⭐ 极优";
-    if (n.delay_ms > 600) {
+    const delay = Number(n.delay_ms || 0);
+    if (delay > 600) {
       badge = "bg-amber-500/20 text-amber-400 border-amber-500/30";
       grade = "⭐⭐⭐⭐ 良好";
     }
-    if (n.delay_ms > 1200) {
+    if (delay > 1200) {
       badge = "bg-blue-500/20 text-blue-400 border-blue-500/30";
       grade = "⭐⭐⭐ 普通";
     }
@@ -287,7 +334,7 @@ async function handleDashboard(request, env, ctx) {
             ${n.protocol}
           </span>
         </td>
-        <td class="py-3 px-4 font-mono font-bold text-emerald-400">${n.delay_ms} ms</td>
+        <td class="py-3 px-4 font-mono font-bold text-emerald-400">${delay} ms</td>
         <td class="py-3 px-4 font-mono text-gray-300">${n.speed_mbps ? n.speed_mbps + ' Mbps' : '未抽样'}</td>
         <td class="py-3 px-4 text-sm">${grade}</td>
         <td class="py-3 px-4 font-mono text-xs text-gray-400 truncate max-w-xs">${host}</td>
@@ -296,18 +343,13 @@ async function handleDashboard(request, env, ctx) {
   }).join("");
 
   let noticeBanner = "";
-  if (d1Notice) {
-    const isQuota = d1Notice.includes("7500") || d1Notice.includes("exceeded") || d1Notice.includes("limit");
-    const tip = isQuota
-      ? "Cloudflare D1 免费版今日行读取配额（500万行）已触顶。系统已自动开启边缘只读保护，将在 UTC 00:00（约几小时后）重置额度，或升级至 Workers Paid 计划。"
-      : d1Notice;
-
+  if (dbError) {
     noticeBanner = `
       <div class="bg-amber-950/40 border border-amber-500/40 rounded-xl p-4 my-4 flex items-start gap-3 text-amber-300 text-xs">
         <span class="text-base">⚠️</span>
         <div class="leading-relaxed">
-          <div class="font-bold mb-0.5">D1 边缘数据库限额提示</div>
-          <div>${tip}</div>
+          <div class="font-bold mb-0.5">PostgreSQL / Hyperdrive 连接提示</div>
+          <div>${dbError}</div>
         </div>
       </div>
     `;
@@ -338,9 +380,9 @@ async function handleDashboard(request, env, ctx) {
     <div class="flex flex-col md:flex-row items-start md:items-center justify-between pb-6 border-b border-gray-800 gap-4">
       <div>
         <h1 class="text-2xl font-bold bg-gradient-to-r from-blue-400 via-teal-300 to-emerald-400 bg-clip-text text-transparent">
-          🌐 全球代理池实时大盘 (Cloudflare D1)
+          🌐 全球代理池实时大盘
         </h1>
-        <p class="text-xs text-gray-400 mt-1">海外粗筛 + 国内精筛 · 24小时全自动清洗池</p>
+        <p class="text-xs text-gray-400 mt-1">PostgreSQL (proxy.nodes) · Cloudflare Hyperdrive 边缘加速驱动</p>
       </div>
       <div class="flex items-center gap-2">
         <button id="btnSub" onclick="copyText('${subUrl}', 'btnSub')" class="px-3 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-xs font-semibold shadow transition">
@@ -405,7 +447,7 @@ async function handleDashboard(request, env, ctx) {
 
     <!-- Footer -->
     <div class="mt-8 text-center text-xs text-gray-600">
-      由 Cloudflare Worker & D1 全球边缘驱动 · 零服务器开销 · 智能边缘缓存保护
+      由 Cloudflare Worker & Hyperdrive (PostgreSQL) 边缘驱动 · 零服务器开销 · 智能边缘缓存保护
     </div>
   </div>
 </body>

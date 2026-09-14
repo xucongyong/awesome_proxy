@@ -1,9 +1,8 @@
 name = "awesome-proxy"
 main = "worker.js"
-compatibility_date = "2024-09-01"
+compatibility_date = "2025-02-04"
+compatibility_flags = ["nodejs_compat"]
 
-# 绑定现有的 Cloudflare D1 数据库
-[[d1_databases]]
-binding = "DB"
-database_name = "nodes-db"
-database_id = "3b55a783-16d9-4f31-bd9f-312972752269"
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "cda90112dc814982a46aa4168e6bd851"

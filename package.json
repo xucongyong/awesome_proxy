@@ -1,0 +1,17 @@
+{
+  "name": "awesome-proxy",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker Proxy Hub with Hyperdrive PostgreSQL",
+  "main": "worker.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "wrangler": "^3.109.2"
+  }
+}

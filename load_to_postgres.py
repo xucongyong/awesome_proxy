@@ -20,7 +20,7 @@ def load_to_postgres(conn_str: str, json_file: str = "nodes_backup.json"):
         logger.error(f"Backup file not found: {json_file}")
         return
 
-    logger.info(f"Connecting to PostgreSQL...")
+    logger.info("Connecting to PostgreSQL...")
     try:
         conn = psycopg2.connect(conn_str)
     except Exception as e:
@@ -30,15 +30,15 @@ def load_to_postgres(conn_str: str, json_file: str = "nodes_backup.json"):
     conn.autocommit = True
     cur = conn.cursor()
 
-    logger.info("Checking and initializing PostgreSQL table schema...")
+    logger.info("Checking and updating PostgreSQL table schema & hash index...")
     cur.execute("""
     CREATE TABLE IF NOT EXISTS nodes (
         id SERIAL PRIMARY KEY,
-        node_url TEXT UNIQUE NOT NULL,
-        protocol TEXT NOT NULL,
+        node_url TEXT NOT NULL,
+        protocol VARCHAR(32) NOT NULL,
         first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         last_tested TIMESTAMP,
-        status TEXT DEFAULT 'untested',
+        status VARCHAR(32) DEFAULT 'untested',
         is_active INTEGER DEFAULT NULL,
         source_url TEXT,
         delay_ms INTEGER DEFAULT -1,
@@ -52,6 +52,15 @@ def load_to_postgres(conn_str: str, json_file: str = "nodes_backup.json"):
         global_last_tested TIMESTAMP
     );
     """)
+
+    # Drop standard btree constraint on node_url if it exists because URLs > 2704 bytes exceed btree page limit
+    try:
+        cur.execute("ALTER TABLE nodes DROP CONSTRAINT IF EXISTS nodes_node_url_key;")
+    except Exception:
+        pass
+
+    # Create safe MD5 hash unique index (never exceeds 32 bytes)
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_url_hash ON nodes (md5(node_url));")
 
     for col_name, col_type in [
         ("source_url", "TEXT"),
@@ -89,7 +98,7 @@ def load_to_postgres(conn_str: str, json_file: str = "nodes_backup.json"):
         %(delay_ms)s, %(speed_mbps)s, %(fail_count)s, %(is_active)s, %(source_url)s,
         %(cn_delay_ms)s, %(cn_is_active)s, %(cn_last_tested)s,
         %(global_delay_ms)s, %(global_is_active)s, %(global_last_tested)s
-    ) ON CONFLICT (node_url) DO UPDATE SET
+    ) ON CONFLICT ((md5(node_url))) DO UPDATE SET
         cn_is_active = COALESCE(EXCLUDED.cn_is_active, nodes.cn_is_active),
         global_is_active = COALESCE(EXCLUDED.global_is_active, nodes.global_is_active),
         status = EXCLUDED.status;

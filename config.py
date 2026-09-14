@@ -36,7 +36,9 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
 CLOUDFLARE_DATABASE_ID = os.getenv("CLOUDFLARE_DATABASE_ID", "")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
 
-# Database mode: force local if requested or if CF credentials missing
+# Database mode: force local if requested, or PostgreSQL if DATABASE_URL provided, or CF D1
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+POSTGRES_SCHEMA = os.getenv("POSTGRES_SCHEMA", "proxy")
 FORCE_LOCAL_DB = os.getenv("FORCE_LOCAL_DB", "0").lower() in ("1", "true", "yes")
 LOCAL_DB_PATH = os.getenv("LOCAL_DB_PATH", str(BASE_DIR / "nodes.db"))
 

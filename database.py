@@ -9,8 +9,10 @@ from config import (
     CLOUDFLARE_ACCOUNT_ID,
     CLOUDFLARE_API_TOKEN,
     CLOUDFLARE_DATABASE_ID,
+    DATABASE_URL,
     FORCE_LOCAL_DB,
     LOCAL_DB_PATH,
+    POSTGRES_SCHEMA,
 )
 
 logger = logging.getLogger("database")
@@ -354,6 +356,286 @@ class SQLiteDatabase(Database):
 
 
 
+class PostgresDatabase(Database):
+    """PostgreSQL database implementation with schema support (e.g. proxy.nodes)."""
+
+    def __init__(self, conn_str: str, schema: str = "proxy"):
+        self.conn_str = conn_str
+        self.schema = schema or "proxy"
+        self._init_tables()
+
+    def _get_connection(self):
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(self.conn_str)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema};")
+            cur.execute(f"SET search_path TO {self.schema}, public;")
+        return conn
+
+    def _init_tables(self) -> None:
+        self.init_db()
+
+    def init_db(self) -> None:
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS nodes (
+                    id SERIAL PRIMARY KEY,
+                    node_url TEXT NOT NULL,
+                    protocol VARCHAR(32) NOT NULL,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_tested TIMESTAMP,
+                    status VARCHAR(32) DEFAULT 'untested',
+                    is_active INTEGER DEFAULT NULL,
+                    source_url TEXT,
+                    delay_ms INTEGER DEFAULT -1,
+                    speed_mbps REAL DEFAULT 0.0,
+                    fail_count INTEGER DEFAULT 0,
+                    cn_delay_ms INTEGER DEFAULT -1,
+                    cn_is_active INTEGER DEFAULT NULL,
+                    cn_last_tested TIMESTAMP,
+                    global_delay_ms INTEGER DEFAULT -1,
+                    global_is_active INTEGER DEFAULT NULL,
+                    global_last_tested TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS fetch_logs (
+                    id SERIAL PRIMARY KEY,
+                    last_pushed_date TEXT NOT NULL,
+                    nodes_found INTEGER DEFAULT 0,
+                    nodes_added INTEGER DEFAULT 0,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """)
+                try:
+                    cur.execute("ALTER TABLE nodes DROP CONSTRAINT IF EXISTS nodes_node_url_key;")
+                except Exception:
+                    pass
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_url_hash ON nodes (md5(node_url));")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_delay ON nodes(delay_ms);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON nodes(cn_is_active);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON nodes(global_is_active);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON nodes(cn_last_tested);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON nodes(global_last_tested);")
+
+    def get_last_pushed_date(self) -> Optional[str]:
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT last_pushed_date FROM fetch_logs ORDER BY id DESC LIMIT 1;")
+                row = cur.fetchone()
+                return row[0] if row else None
+
+    def record_fetch_log(self, last_pushed_date: str, nodes_found: int, nodes_added: int) -> None:
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO fetch_logs (last_pushed_date, nodes_found, nodes_added) VALUES (%s, %s, %s);",
+                    (last_pushed_date, nodes_found, nodes_added),
+                )
+
+    def insert_nodes_batch(self, node_urls: Any, source_url: Optional[str] = None) -> int:
+        if not node_urls:
+            return 0
+        added = 0
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                for item in node_urls:
+                    if isinstance(item, tuple):
+                        url, src = item[0], item[1] or source_url
+                    else:
+                        url, src = item, source_url
+                    proto = extract_protocol(url)
+                    cur.execute(
+                        """
+                        INSERT INTO nodes (node_url, protocol, source_url)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT ((md5(node_url))) DO UPDATE SET source_url = COALESCE(nodes.source_url, EXCLUDED.source_url)
+                        WHERE nodes.source_url IS NULL AND EXCLUDED.source_url IS NOT NULL;
+                        """,
+                        (url, proto, src),
+                    )
+                    if cur.rowcount > 0:
+                        added += 1
+        return added
+
+    def get_nodes_for_testing(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
+        import psycopg2.extras
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if region == "global":
+                    sql = """
+                        SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
+                        FROM nodes
+                        WHERE status IN ('untested', 'active') OR global_is_active IS NULL
+                        ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
+                                 CASE WHEN global_is_active IS NULL THEN id END DESC,
+                                 global_last_tested ASC NULLS FIRST
+                        LIMIT %s;
+                    """
+                else:
+                    sql = """
+                        SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
+                        FROM nodes
+                        WHERE (global_is_active = 1 OR status = 'active' OR cn_is_active IS NULL)
+                          AND status != 'dead'
+                        ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
+                                 CASE WHEN cn_is_active IS NULL THEN id END DESC,
+                                 cn_last_tested ASC NULLS FIRST
+                        LIMIT %s;
+                    """
+                cur.execute(sql, (limit,))
+                return [dict(row) for row in cur.fetchall()]
+
+    def update_test_result(
+        self,
+        node_id: int,
+        status: str,
+        delay_ms: int,
+        speed_mbps: float,
+        fail_count: int,
+        region: str = "cn",
+    ) -> None:
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                if region == "global":
+                    cur.execute(
+                        """
+                        UPDATE nodes
+                        SET status = %s,
+                            delay_ms = %s,
+                            speed_mbps = %s,
+                            fail_count = %s,
+                            last_tested = CURRENT_TIMESTAMP,
+                            is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                            global_delay_ms = %s,
+                            global_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                            global_last_tested = CURRENT_TIMESTAMP
+                        WHERE id = %s;
+                        """,
+                        (status, delay_ms, speed_mbps, fail_count, status, delay_ms, status, node_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE nodes
+                        SET status = %s,
+                            delay_ms = %s,
+                            speed_mbps = %s,
+                            fail_count = %s,
+                            last_tested = CURRENT_TIMESTAMP,
+                            is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                            cn_delay_ms = %s,
+                            cn_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                            cn_last_tested = CURRENT_TIMESTAMP
+                        WHERE id = %s;
+                        """,
+                        (status, delay_ms, speed_mbps, fail_count, status, delay_ms, status, node_id),
+                    )
+
+    def update_test_results_batch(
+        self,
+        results: List[Tuple[int, str, int, float, int]],
+        region: str = "cn",
+    ) -> None:
+        if not results:
+            return
+        import psycopg2.extras
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                if region == "global":
+                    sql = """
+                        UPDATE nodes
+                        SET status = data.status,
+                            delay_ms = data.delay_ms,
+                            speed_mbps = data.speed_mbps,
+                            fail_count = data.fail_count,
+                            last_tested = CURRENT_TIMESTAMP,
+                            is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                            global_delay_ms = data.delay_ms,
+                            global_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                            global_last_tested = CURRENT_TIMESTAMP
+                        FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
+                        WHERE nodes.id = data.id;
+                    """
+                else:
+                    sql = """
+                        UPDATE nodes
+                        SET status = data.status,
+                            delay_ms = data.delay_ms,
+                            speed_mbps = data.speed_mbps,
+                            fail_count = data.fail_count,
+                            last_tested = CURRENT_TIMESTAMP,
+                            is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                            cn_delay_ms = data.delay_ms,
+                            cn_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                            cn_last_tested = CURRENT_TIMESTAMP
+                        FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
+                        WHERE nodes.id = data.id;
+                    """
+                psycopg2.extras.execute_values(cur, sql, results, template="(%s, %s, %s, %s, %s)")
+
+    def get_active_nodes(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
+        import psycopg2.extras
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if region == "global":
+                    sql = """
+                        SELECT id, node_url, protocol,
+                               COALESCE(global_delay_ms, delay_ms) AS delay_ms,
+                               speed_mbps, fail_count,
+                               COALESCE(global_last_tested, last_tested) AS last_tested,
+                               global_is_active AS is_active
+                        FROM nodes
+                        WHERE global_is_active = 1
+                        ORDER BY COALESCE(global_delay_ms, delay_ms) ASC, speed_mbps DESC
+                        LIMIT %s;
+                    """
+                else:
+                    sql = """
+                        SELECT id, node_url, protocol,
+                               COALESCE(cn_delay_ms, delay_ms) AS delay_ms,
+                               speed_mbps, fail_count,
+                               COALESCE(cn_last_tested, last_tested) AS last_tested,
+                               cn_is_active AS is_active
+                        FROM nodes
+                        WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
+                          AND COALESCE(cn_delay_ms, delay_ms) > 0
+                        ORDER BY COALESCE(cn_delay_ms, delay_ms) ASC, speed_mbps DESC
+                        LIMIT %s;
+                    """
+                cur.execute(sql, (limit,))
+                return [dict(row) for row in cur.fetchall()]
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        (SELECT COUNT(*) FROM nodes) AS total,
+                        (SELECT COUNT(*) FROM nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS active,
+                        (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested,
+                        (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead;
+                """)
+                row = cur.fetchone()
+                return {
+                    "total": row[0] if row else 0,
+                    "active": row[1] if row else 0,
+                    "untested": row[2] if row else 0,
+                    "dead": row[3] if row else 0,
+                }
+
+    def clean_dead_nodes(self, days: int = 30) -> int:
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM nodes WHERE status = 'dead' AND fail_count >= 3 AND last_tested < NOW() - INTERVAL '{days} days';"
+                )
+                return cur.rowcount
+
+
+
 class D1Database(Database):
     """Cloudflare D1 Serverless SQL implementation via Cloudflare v4 REST API."""
 
@@ -643,6 +925,11 @@ def get_database(force_local: bool = False, db_path: Optional[str] = None) -> Da
     if force_local or FORCE_LOCAL_DB:
         logger.info(f"Using SQLite database at {db_path or LOCAL_DB_PATH}")
         return SQLiteDatabase(db_path or LOCAL_DB_PATH)
+
+    if DATABASE_URL:
+        masked_url = DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else DATABASE_URL
+        logger.info(f"Using PostgreSQL database ({masked_url}, schema: {POSTGRES_SCHEMA})")
+        return PostgresDatabase(DATABASE_URL, schema=POSTGRES_SCHEMA)
 
     if CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_DATABASE_ID and CLOUDFLARE_API_TOKEN:
         logger.info(f"Using Cloudflare D1 Database ID {CLOUDFLARE_DATABASE_ID}")

@@ -22,7 +22,7 @@ def export_to_postgres(json_file: str = "nodes_backup.json", sql_file: str = "po
         out.write("""-- PostgreSQL Schema & Data for Awesome Proxy Pool
 CREATE TABLE IF NOT EXISTS nodes (
     id SERIAL PRIMARY KEY,
-    node_url TEXT UNIQUE NOT NULL,
+    node_url TEXT NOT NULL,
     protocol VARCHAR(32) NOT NULL,
     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_tested TIMESTAMP,
@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     global_is_active INTEGER DEFAULT NULL,
     global_last_tested TIMESTAMP
 );
+
+ALTER TABLE nodes DROP CONSTRAINT IF EXISTS nodes_node_url_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_url_hash ON nodes (md5(node_url));
 
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS source_url TEXT;
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS cn_delay_ms INTEGER DEFAULT -1;
@@ -89,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON nodes(global_last_tested);
                 sql_val(n.get("global_is_active")),
                 sql_val(n.get("global_last_tested"))
             ]
-            out.write(f"INSERT INTO nodes ({', '.join(cols)}) VALUES ({', '.join(vals)}) ON CONFLICT (node_url) DO UPDATE SET cn_is_active = EXCLUDED.cn_is_active, global_is_active = EXCLUDED.global_is_active, status = EXCLUDED.status;\n")
+            out.write(f"INSERT INTO nodes ({', '.join(cols)}) VALUES ({', '.join(vals)}) ON CONFLICT ((md5(node_url))) DO UPDATE SET cn_is_active = EXCLUDED.cn_is_active, global_is_active = EXCLUDED.global_is_active, status = EXCLUDED.status;\n")
 
         out.write("SELECT setval(pg_get_serial_sequence('nodes', 'id'), COALESCE(max(id)+1, 1), false) FROM nodes;\n")
 
