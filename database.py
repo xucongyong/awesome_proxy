@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import sqlite3
@@ -446,6 +447,7 @@ class PostgresDatabase(Database):
             CREATE TABLE IF NOT EXISTS {self.schema}.nodes (
                 id SERIAL PRIMARY KEY,
                 node_url TEXT NOT NULL,
+                node_hash VARCHAR(64),
                 protocol VARCHAR(32) NOT NULL,
                 first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_tested TIMESTAMP,
@@ -474,7 +476,21 @@ class PostgresDatabase(Database):
                 cur.execute(f"ALTER TABLE {self.schema}.nodes DROP CONSTRAINT IF EXISTS nodes_node_url_key;")
             except Exception:
                 pass
-            cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_url_hash ON {self.schema}.nodes (md5(node_url));")
+            try:
+                cur.execute(f"DROP INDEX IF EXISTS {self.schema}.idx_nodes_node_url_hash;")
+            except Exception:
+                pass
+            cur.execute(f"ALTER TABLE {self.schema}.nodes ADD COLUMN IF NOT EXISTS node_hash VARCHAR(64);")
+
+            # Backfill node_hash for existing rows if needed
+            cur.execute(f"SELECT id, node_url FROM {self.schema}.nodes WHERE node_hash IS NULL LIMIT 20000;")
+            null_rows = cur.fetchall()
+            if null_rows:
+                for nid, nurl in null_rows:
+                    nh = hashlib.sha256(nurl.encode('utf-8')).hexdigest()
+                    cur.execute(f"UPDATE {self.schema}.nodes SET node_hash = %s WHERE id = %s;", (nh, nid))
+
+            cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_hash ON {self.schema}.nodes (node_hash);")
             cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_status ON {self.schema}.nodes(status);")
             cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_delay ON {self.schema}.nodes(delay_ms);")
             cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON {self.schema}.nodes(cn_is_active);")
@@ -506,14 +522,15 @@ class PostgresDatabase(Database):
                 else:
                     url, src = item, source_url
                 proto = extract_protocol(url)
+                nh = hashlib.sha256(url.encode('utf-8')).hexdigest()
                 cur.execute(
                     f"""
-                    INSERT INTO {self.schema}.nodes (node_url, protocol, source_url)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT ((md5(node_url))) DO UPDATE SET source_url = COALESCE({self.schema}.nodes.source_url, EXCLUDED.source_url)
+                    INSERT INTO {self.schema}.nodes (node_url, protocol, source_url, node_hash)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (node_hash) DO UPDATE SET source_url = COALESCE({self.schema}.nodes.source_url, EXCLUDED.source_url)
                     WHERE {self.schema}.nodes.source_url IS NULL AND EXCLUDED.source_url IS NOT NULL;
                     """,
-                    (url, proto, src),
+                    (url, proto, src, nh),
                 )
                 if cur.rowcount > 0:
                     added += 1
