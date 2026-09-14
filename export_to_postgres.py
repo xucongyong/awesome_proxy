@@ -19,8 +19,7 @@ def export_to_postgres(json_file: str = "nodes_backup.json", sql_file: str = "po
     logger.info(f"Loaded {len(nodes)} nodes from {json_file}. Generating {sql_file} for PostgreSQL...")
 
     with open(sql_file, "w", encoding="utf-8") as out:
-        out.write("""
--- PostgreSQL Schema & Data for Awesome Proxy Pool
+        out.write("""-- PostgreSQL Schema & Data for Awesome Proxy Pool
 CREATE TABLE IF NOT EXISTS nodes (
     id SERIAL PRIMARY KEY,
     node_url TEXT UNIQUE NOT NULL,
@@ -41,13 +40,20 @@ CREATE TABLE IF NOT EXISTS nodes (
     global_last_tested TIMESTAMP
 );
 
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS source_url TEXT;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS cn_delay_ms INTEGER DEFAULT -1;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS cn_is_active INTEGER DEFAULT NULL;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS cn_last_tested TIMESTAMP;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS global_delay_ms INTEGER DEFAULT -1;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS global_is_active INTEGER DEFAULT NULL;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS global_last_tested TIMESTAMP;
+
 CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
 CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON nodes(cn_is_active);
 CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON nodes(global_is_active);
 CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON nodes(cn_last_tested);
 CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON nodes(global_last_tested);
 
-BEGIN;
 """)
         for n in nodes:
             def sql_val(val):
@@ -55,8 +61,8 @@ BEGIN;
                     return "NULL"
                 if isinstance(val, (int, float)):
                     return str(val)
-                s = str(val).replace("'", "''")
-                return f"'{s}'"
+                s = str(val).replace("'", "''").replace("\\", "\\\\")
+                return f"E'{s}'"
 
             cols = [
                 "id", "node_url", "protocol", "first_seen", "last_tested", "status",
@@ -83,9 +89,8 @@ BEGIN;
                 sql_val(n.get("global_is_active")),
                 sql_val(n.get("global_last_tested"))
             ]
-            out.write(f"INSERT INTO nodes ({', '.join(cols)}) VALUES ({', '.join(vals)}) ON CONFLICT (node_url) DO NOTHING;\n")
+            out.write(f"INSERT INTO nodes ({', '.join(cols)}) VALUES ({', '.join(vals)}) ON CONFLICT (node_url) DO UPDATE SET cn_is_active = EXCLUDED.cn_is_active, global_is_active = EXCLUDED.global_is_active, status = EXCLUDED.status;\n")
 
-        out.write("COMMIT;\n")
         out.write("SELECT setval(pg_get_serial_sequence('nodes', 'id'), COALESCE(max(id)+1, 1), false) FROM nodes;\n")
 
     logger.info(f"Generated {sql_file} successfully! Run 'psql -d <your_db> -f {sql_file}' to import.")
