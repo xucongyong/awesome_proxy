@@ -357,7 +357,7 @@ class SQLiteDatabase(Database):
 
 
 class PostgresDatabase(Database):
-    """PostgreSQL database implementation with schema support (e.g. proxy.nodes)."""
+    """PostgreSQL database implementation with dual driver support (psycopg2 or pg8000) and schema support."""
 
     def __init__(self, conn_str: str, schema: str = "proxy"):
         self.conn_str = conn_str
@@ -365,14 +365,48 @@ class PostgresDatabase(Database):
         self._init_tables()
 
     def _get_connection(self):
-        import psycopg2
-        import psycopg2.extras
-        conn = psycopg2.connect(self.conn_str)
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema};")
-            cur.execute(f"SET search_path TO {self.schema}, public;")
-        return conn
+        # 1. Try standard psycopg2 driver
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.conn_str)
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema};")
+                cur.execute(f"SET search_path TO {self.schema}, public;")
+            return conn
+        except ImportError:
+            pass
+
+        # 2. Fallback to pure-Python pg8000 driver (zero C compilation, ideal for OpenWrt/ImmortalWrt)
+        try:
+            import pg8000.dbapi
+            u = urllib.parse.urlparse(self.conn_str)
+            conn = pg8000.dbapi.connect(
+                user=u.username or "postgres",
+                password=u.password or "",
+                host=u.hostname or "localhost",
+                port=u.port or 5432,
+                database=u.path.lstrip("/") or "postgres",
+            )
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema};")
+                cur.execute(f"SET search_path TO {self.schema}, public;")
+            return conn
+        except ImportError:
+            raise RuntimeError(
+                "Neither 'psycopg2' nor 'pg8000' is installed on this system.\n"
+                "To fix this easily on OpenWrt / ImmortalWrt, run:\n"
+                "  pip3 install pg8000\n"
+                "or:\n"
+                "  opkg update && opkg install python3-psycopg2"
+            )
+
+    def _fetch_dicts(self, cur) -> List[Dict[str, Any]]:
+        if not cur.description:
+            return []
+        cols = [col[0] for col in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def _init_tables(self) -> None:
         self.init_db()
@@ -380,8 +414,8 @@ class PostgresDatabase(Database):
     def init_db(self) -> None:
         with self._get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS nodes (
+                cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.schema}.nodes (
                     id SERIAL PRIMARY KEY,
                     node_url TEXT NOT NULL,
                     protocol VARCHAR(32) NOT NULL,
@@ -400,7 +434,7 @@ class PostgresDatabase(Database):
                     global_is_active INTEGER DEFAULT NULL,
                     global_last_tested TIMESTAMP
                 );
-                CREATE TABLE IF NOT EXISTS fetch_logs (
+                CREATE TABLE IF NOT EXISTS {self.schema}.fetch_logs (
                     id SERIAL PRIMARY KEY,
                     last_pushed_date TEXT NOT NULL,
                     nodes_found INTEGER DEFAULT 0,
@@ -409,21 +443,21 @@ class PostgresDatabase(Database):
                 );
                 """)
                 try:
-                    cur.execute("ALTER TABLE nodes DROP CONSTRAINT IF EXISTS nodes_node_url_key;")
+                    cur.execute(f"ALTER TABLE {self.schema}.nodes DROP CONSTRAINT IF EXISTS nodes_node_url_key;")
                 except Exception:
                     pass
-                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_url_hash ON nodes (md5(node_url));")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_delay ON nodes(delay_ms);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON nodes(cn_is_active);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON nodes(global_is_active);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON nodes(cn_last_tested);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON nodes(global_last_tested);")
+                cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_node_url_hash ON {self.schema}.nodes (md5(node_url));")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_status ON {self.schema}.nodes(status);")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_delay ON {self.schema}.nodes(delay_ms);")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_cn_active ON {self.schema}.nodes(cn_is_active);")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_global_active ON {self.schema}.nodes(global_is_active);")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_cn_tested ON {self.schema}.nodes(cn_last_tested);")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_nodes_global_tested ON {self.schema}.nodes(global_last_tested);")
 
     def get_last_pushed_date(self) -> Optional[str]:
         with self._get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT last_pushed_date FROM fetch_logs ORDER BY id DESC LIMIT 1;")
+                cur.execute(f"SELECT last_pushed_date FROM {self.schema}.fetch_logs ORDER BY id DESC LIMIT 1;")
                 row = cur.fetchone()
                 return row[0] if row else None
 
@@ -431,7 +465,7 @@ class PostgresDatabase(Database):
         with self._get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO fetch_logs (last_pushed_date, nodes_found, nodes_added) VALUES (%s, %s, %s);",
+                    f"INSERT INTO {self.schema}.fetch_logs (last_pushed_date, nodes_found, nodes_added) VALUES (%s, %s, %s);",
                     (last_pushed_date, nodes_found, nodes_added),
                 )
 
@@ -448,11 +482,11 @@ class PostgresDatabase(Database):
                         url, src = item, source_url
                     proto = extract_protocol(url)
                     cur.execute(
-                        """
-                        INSERT INTO nodes (node_url, protocol, source_url)
+                        f"""
+                        INSERT INTO {self.schema}.nodes (node_url, protocol, source_url)
                         VALUES (%s, %s, %s)
-                        ON CONFLICT ((md5(node_url))) DO UPDATE SET source_url = COALESCE(nodes.source_url, EXCLUDED.source_url)
-                        WHERE nodes.source_url IS NULL AND EXCLUDED.source_url IS NOT NULL;
+                        ON CONFLICT ((md5(node_url))) DO UPDATE SET source_url = COALESCE({self.schema}.nodes.source_url, EXCLUDED.source_url)
+                        WHERE {self.schema}.nodes.source_url IS NULL AND EXCLUDED.source_url IS NOT NULL;
                         """,
                         (url, proto, src),
                     )
@@ -461,13 +495,12 @@ class PostgresDatabase(Database):
         return added
 
     def get_nodes_for_testing(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
-        import psycopg2.extras
         with self._get_connection() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor() as cur:
                 if region == "global":
-                    sql = """
+                    sql = f"""
                         SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
-                        FROM nodes
+                        FROM {self.schema}.nodes
                         WHERE status IN ('untested', 'active') OR global_is_active IS NULL
                         ORDER BY CASE WHEN global_is_active IS NULL THEN 0 ELSE 1 END,
                                  CASE WHEN global_is_active IS NULL THEN id END DESC,
@@ -475,9 +508,9 @@ class PostgresDatabase(Database):
                         LIMIT %s;
                     """
                 else:
-                    sql = """
+                    sql = f"""
                         SELECT id, node_url, protocol, status, delay_ms, speed_mbps, fail_count, cn_is_active, global_is_active
-                        FROM nodes
+                        FROM {self.schema}.nodes
                         WHERE (global_is_active = 1 OR status = 'active' OR cn_is_active IS NULL)
                           AND status != 'dead'
                         ORDER BY CASE WHEN cn_is_active IS NULL THEN 0 ELSE 1 END,
@@ -486,7 +519,7 @@ class PostgresDatabase(Database):
                         LIMIT %s;
                     """
                 cur.execute(sql, (limit,))
-                return [dict(row) for row in cur.fetchall()]
+                return self._fetch_dicts(cur)
 
     def update_test_result(
         self,
@@ -501,8 +534,8 @@ class PostgresDatabase(Database):
             with conn.cursor() as cur:
                 if region == "global":
                     cur.execute(
-                        """
-                        UPDATE nodes
+                        f"""
+                        UPDATE {self.schema}.nodes
                         SET status = %s,
                             delay_ms = %s,
                             speed_mbps = %s,
@@ -518,8 +551,8 @@ class PostgresDatabase(Database):
                     )
                 else:
                     cur.execute(
-                        """
-                        UPDATE nodes
+                        f"""
+                        UPDATE {self.schema}.nodes
                         SET status = %s,
                             delay_ms = %s,
                             speed_mbps = %s,
@@ -541,82 +574,124 @@ class PostgresDatabase(Database):
     ) -> None:
         if not results:
             return
-        import psycopg2.extras
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                # Fast bulk update with psycopg2.extras.execute_values if available
+                has_execute_values = False
+                try:
+                    import psycopg2.extras
+                    has_execute_values = hasattr(psycopg2.extras, "execute_values")
+                except ImportError:
+                    pass
+
+                if has_execute_values:
+                    if region == "global":
+                        sql = f"""
+                            UPDATE {self.schema}.nodes
+                            SET status = data.status,
+                                delay_ms = data.delay_ms,
+                                speed_mbps = data.speed_mbps,
+                                fail_count = data.fail_count,
+                                last_tested = CURRENT_TIMESTAMP,
+                                is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                                global_delay_ms = data.delay_ms,
+                                global_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                                global_last_tested = CURRENT_TIMESTAMP
+                            FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
+                            WHERE {self.schema}.nodes.id = data.id;
+                        """
+                    else:
+                        sql = f"""
+                            UPDATE {self.schema}.nodes
+                            SET status = data.status,
+                                delay_ms = data.delay_ms,
+                                speed_mbps = data.speed_mbps,
+                                fail_count = data.fail_count,
+                                last_tested = CURRENT_TIMESTAMP,
+                                is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                                cn_delay_ms = data.delay_ms,
+                                cn_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
+                                cn_last_tested = CURRENT_TIMESTAMP
+                            FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
+                            WHERE {self.schema}.nodes.id = data.id;
+                        """
+                    psycopg2.extras.execute_values(cur, sql, results, template="(%s, %s, %s, %s, %s)")
+                else:
+                    # Universal executemany execution (works on pg8000 and any DB-API 2.0 driver)
+                    if region == "global":
+                        sql = f"""
+                            UPDATE {self.schema}.nodes
+                            SET status = %s,
+                                delay_ms = %s,
+                                speed_mbps = %s,
+                                fail_count = %s,
+                                last_tested = CURRENT_TIMESTAMP,
+                                is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                                global_delay_ms = %s,
+                                global_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                                global_last_tested = CURRENT_TIMESTAMP
+                            WHERE id = %s;
+                        """
+                    else:
+                        sql = f"""
+                            UPDATE {self.schema}.nodes
+                            SET status = %s,
+                                delay_ms = %s,
+                                speed_mbps = %s,
+                                fail_count = %s,
+                                last_tested = CURRENT_TIMESTAMP,
+                                is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                                cn_delay_ms = %s,
+                                cn_is_active = CASE WHEN %s = 'active' THEN 1 ELSE 0 END,
+                                cn_last_tested = CURRENT_TIMESTAMP
+                            WHERE id = %s;
+                        """
+                    params = [
+                        (st, dl, sp, fc, st, dl, st, nid)
+                        for nid, st, dl, sp, fc in results
+                    ]
+                    cur.executemany(sql, params)
+
+    def get_active_nodes(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
             with conn.cursor() as cur:
                 if region == "global":
-                    sql = """
-                        UPDATE nodes
-                        SET status = data.status,
-                            delay_ms = data.delay_ms,
-                            speed_mbps = data.speed_mbps,
-                            fail_count = data.fail_count,
-                            last_tested = CURRENT_TIMESTAMP,
-                            is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
-                            global_delay_ms = data.delay_ms,
-                            global_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
-                            global_last_tested = CURRENT_TIMESTAMP
-                        FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
-                        WHERE nodes.id = data.id;
-                    """
-                else:
-                    sql = """
-                        UPDATE nodes
-                        SET status = data.status,
-                            delay_ms = data.delay_ms,
-                            speed_mbps = data.speed_mbps,
-                            fail_count = data.fail_count,
-                            last_tested = CURRENT_TIMESTAMP,
-                            is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
-                            cn_delay_ms = data.delay_ms,
-                            cn_is_active = CASE WHEN data.status = 'active' THEN 1 ELSE 0 END,
-                            cn_last_tested = CURRENT_TIMESTAMP
-                        FROM (VALUES %s) AS data (id, status, delay_ms, speed_mbps, fail_count)
-                        WHERE nodes.id = data.id;
-                    """
-                psycopg2.extras.execute_values(cur, sql, results, template="(%s, %s, %s, %s, %s)")
-
-    def get_active_nodes(self, limit: int = 50, region: str = "cn") -> List[Dict[str, Any]]:
-        import psycopg2.extras
-        with self._get_connection() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                if region == "global":
-                    sql = """
+                    sql = f"""
                         SELECT id, node_url, protocol,
                                COALESCE(global_delay_ms, delay_ms) AS delay_ms,
                                speed_mbps, fail_count,
                                COALESCE(global_last_tested, last_tested) AS last_tested,
                                global_is_active AS is_active
-                        FROM nodes
+                        FROM {self.schema}.nodes
                         WHERE global_is_active = 1
                         ORDER BY COALESCE(global_delay_ms, delay_ms) ASC, speed_mbps DESC
                         LIMIT %s;
                     """
                 else:
-                    sql = """
+                    sql = f"""
                         SELECT id, node_url, protocol,
                                COALESCE(cn_delay_ms, delay_ms) AS delay_ms,
                                speed_mbps, fail_count,
                                COALESCE(cn_last_tested, last_tested) AS last_tested,
                                cn_is_active AS is_active
-                        FROM nodes
+                        FROM {self.schema}.nodes
                         WHERE (cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active'))
                           AND COALESCE(cn_delay_ms, delay_ms) > 0
                         ORDER BY COALESCE(cn_delay_ms, delay_ms) ASC, speed_mbps DESC
                         LIMIT %s;
                     """
                 cur.execute(sql, (limit,))
-                return [dict(row) for row in cur.fetchall()]
+                return self._fetch_dicts(cur)
 
     def get_stats(self) -> Dict[str, Any]:
         with self._get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     SELECT
-                        (SELECT COUNT(*) FROM nodes) AS total,
-                        (SELECT COUNT(*) FROM nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS active,
-                        (SELECT COUNT(*) FROM nodes WHERE status = 'untested') AS untested,
-                        (SELECT COUNT(*) FROM nodes WHERE status = 'dead') AS dead;
+                        (SELECT COUNT(*) FROM {self.schema}.nodes) AS total,
+                        (SELECT COUNT(*) FROM {self.schema}.nodes WHERE cn_is_active = 1 OR (cn_is_active IS NULL AND status = 'active')) AS active,
+                        (SELECT COUNT(*) FROM {self.schema}.nodes WHERE status = 'untested') AS untested,
+                        (SELECT COUNT(*) FROM {self.schema}.nodes WHERE status = 'dead') AS dead;
                 """)
                 row = cur.fetchone()
                 return {
@@ -630,9 +705,10 @@ class PostgresDatabase(Database):
         with self._get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"DELETE FROM nodes WHERE status = 'dead' AND fail_count >= 3 AND last_tested < NOW() - INTERVAL '{days} days';"
+                    f"DELETE FROM {self.schema}.nodes WHERE status = 'dead' AND fail_count >= 3 AND last_tested < NOW() - INTERVAL '{days} days';"
                 )
                 return cur.rowcount
+
 
 
 
