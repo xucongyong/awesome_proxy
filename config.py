@@ -46,10 +46,10 @@ LOCAL_DB_PATH = os.getenv("LOCAL_DB_PATH", str(BASE_DIR / "nodes.db"))
 SING_BOX_PATH = os.getenv("SING_BOX_PATH", "sing-box")
 TEST_URL = os.getenv("TEST_URL", "http://cp.cloudflare.com/generate_204")
 SPEED_TEST_URL = os.getenv("SPEED_TEST_URL", "http://speed.cloudflare.com/__down?bytes=5000000")
-TEST_TIMEOUT = float(os.getenv("TEST_TIMEOUT", "2.5"))  # seconds
+TEST_TIMEOUT = float(os.getenv("TEST_TIMEOUT", "5.0"))  # seconds (default 5.0 for international links)
 MAX_FAIL_COUNT = int(os.getenv("MAX_FAIL_COUNT", "3"))
 FAST_TCP_PRECHECK = os.getenv("FAST_TCP_PRECHECK", "1").lower() in ("1", "true", "yes")
-TCP_PING_TIMEOUT = float(os.getenv("TCP_PING_TIMEOUT", "1.0"))  # seconds for pre-flight check
+TCP_PING_TIMEOUT = float(os.getenv("TCP_PING_TIMEOUT", "2.0"))  # seconds for pre-flight check (default 2.0s)
 
 # Export settings
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", str(BASE_DIR / "output"))

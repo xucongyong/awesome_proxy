@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 
+import config
 from crawler import GitHubCrawler, extract_nodes_from_text
 from database import get_database
 from exporter import Exporter
@@ -117,6 +118,23 @@ def setup_cli() -> argparse.ArgumentParser:
         default=30,
         help="Days threshold for purging dead nodes (default: 30)",
     )
+    parser.add_argument(
+        "--tcp-timeout",
+        type=float,
+        default=None,
+        help="TCP handshake precheck timeout in seconds (default: 2.0)",
+    )
+    parser.add_argument(
+        "--test-timeout",
+        type=float,
+        default=None,
+        help="Proxy latency HTTP probe timeout in seconds (default: 5.0)",
+    )
+    parser.add_argument(
+        "--reset-status",
+        action="store_true",
+        help="Reset all nodes in database to 'untested' and clear failure counts for a clean re-scan",
+    )
     return parser
 
 
@@ -137,6 +155,19 @@ def main() -> None:
     token = args.github_token or os.getenv("GITHUB_TOKEN")
 
     db = get_database(force_local=args.local)
+
+    if args.tcp_timeout is not None:
+        config.TCP_PING_TIMEOUT = args.tcp_timeout
+        logger.info(f"Custom TCP ping timeout configured: {config.TCP_PING_TIMEOUT}s")
+
+    if args.test_timeout is not None:
+        config.TEST_TIMEOUT = args.test_timeout
+        logger.info(f"Custom test probe timeout configured: {config.TEST_TIMEOUT}s")
+
+    if args.reset_status:
+        logger.info("Resetting all nodes to 'untested' and clearing failure counts...")
+        reset_count = db.reset_all_nodes()
+        logger.info(f"Successfully reset {reset_count} nodes to 'untested'.")
 
     if args.init_db:
         logger.info("Initializing database tables...")

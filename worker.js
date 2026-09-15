@@ -68,9 +68,12 @@ async function handleDebug(request, env, ctx) {
   const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
   await client.connect();
   try {
-    const meta = await client.query(`SELECT current_database() as database, current_user as user, current_schema as schema;`);
-    const tables = await client.query(`SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema');`);
-    return new Response(JSON.stringify({ meta: meta.rows[0], tables: tables.rows }, null, 2), { headers: { "Content-Type": "application/json" } });
+    const breakdown = await client.query(`
+      SELECT status, cn_is_active, global_is_active, count(*) as count
+      FROM proxy.nodes
+      GROUP BY status, cn_is_active, global_is_active;
+    `);
+    return new Response(JSON.stringify({ breakdown: breakdown.rows }, null, 2), { headers: { "Content-Type": "application/json" } });
   } catch (err) {
     return new Response(JSON.stringify({ error: err.message }), { headers: { "Content-Type": "application/json" } });
   } finally {

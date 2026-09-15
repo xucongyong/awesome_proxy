@@ -23,10 +23,13 @@ from parser import parse_node_url
 
 logger = logging.getLogger("tester")
 
-def check_tcp_reachable(host: str, port: int, timeout: float = TCP_PING_TIMEOUT) -> bool:
+import config
+
+def check_tcp_reachable(host: str, port: int, timeout: Optional[float] = None) -> bool:
     """Fast pre-flight TCP handshake check to weed out dead hosts without spawning sing-box."""
+    t = timeout if timeout is not None else config.TCP_PING_TIMEOUT
     try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
+        with socket.create_connection((host, int(port)), timeout=t):
             return True
     except Exception:
         return False
@@ -58,11 +61,12 @@ def build_singbox_test_config(outbound_cfg: Dict[str, Any], port: int) -> Dict[s
     }
 
 
-def probe_node_delay(port: int, timeout: float = TEST_TIMEOUT) -> Optional[int]:
+def probe_node_delay(port: int, timeout: Optional[float] = None) -> Optional[int]:
     """
     Send an HTTP probe request via local proxy port to test latency.
     Returns delay in milliseconds, or None on failure.
     """
+    t = timeout if timeout is not None else config.TEST_TIMEOUT
     proxies = {
         "http": f"http://127.0.0.1:{port}",
         "https": f"http://127.0.0.1:{port}",
@@ -72,7 +76,7 @@ def probe_node_delay(port: int, timeout: float = TEST_TIMEOUT) -> Optional[int]:
         resp = requests.get(
             TEST_URL,
             proxies=proxies,
-            timeout=timeout,
+            timeout=t,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
         )
         elapsed_ms = int((time.perf_counter() - start) * 1000)

@@ -81,6 +81,9 @@ class Database:
     def clean_dead_nodes(self, days: int = 30) -> int:
         raise NotImplementedError
 
+    def reset_all_nodes(self) -> int:
+        raise NotImplementedError
+
 
 
 
@@ -355,6 +358,14 @@ class SQLiteDatabase(Database):
             deleted = cur.rowcount
             conn.commit()
             return max(0, deleted)
+
+    def reset_all_nodes(self) -> int:
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE nodes SET status = 'untested', fail_count = 0, cn_is_active = NULL, cn_delay_ms = -1, global_is_active = NULL, global_delay_ms = -1;"
+            )
+            conn.commit()
+            return cur.rowcount
 
 
 
@@ -713,6 +724,13 @@ class PostgresDatabase(Database):
             )
             return cur.rowcount
 
+    def reset_all_nodes(self) -> int:
+        with self._get_cursor() as cur:
+            cur.execute(
+                f"UPDATE {self.schema}.nodes SET status = 'untested', fail_count = 0, cn_is_active = NULL, cn_delay_ms = -1, global_is_active = NULL, global_delay_ms = -1;"
+            )
+            return cur.rowcount
+
 
 
 
@@ -994,6 +1012,12 @@ class D1Database(Database):
 
     def clean_dead_nodes(self, days: int = 30) -> int:
         sql = f"DELETE FROM nodes WHERE status = 'dead' AND fail_count >= 3 AND datetime(last_tested) < datetime('now', '-{days} days');"
+        res = self._execute(sql)
+        meta = res.get("meta", {})
+        return meta.get("changes", 0)
+
+    def reset_all_nodes(self) -> int:
+        sql = "UPDATE nodes SET status = 'untested', fail_count = 0, cn_is_active = NULL, cn_delay_ms = -1, global_is_active = NULL, global_delay_ms = -1;"
         res = self._execute(sql)
         meta = res.get("meta", {})
         return meta.get("changes", 0)

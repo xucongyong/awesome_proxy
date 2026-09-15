@@ -76,6 +76,21 @@ class TestDatabase(unittest.TestCase):
         self.db.record_fetch_log("2026-09-10", nodes_found=50, nodes_added=20)
         self.assertEqual(self.db.get_last_pushed_date(), "2026-09-10")
 
+    def test_reset_all_nodes(self):
+        urls = ["vless://u1@example.com:443", "trojan://u2@example.com:443"]
+        self.db.insert_nodes_batch(urls)
+        nodes = self.db.get_nodes_for_testing(limit=10)
+        self.db.update_test_result(node_id=nodes[0]["id"], status="dead", delay_ms=-1, speed_mbps=0, fail_count=3)
+        self.db.update_test_result(node_id=nodes[1]["id"], status="active", delay_ms=150, speed_mbps=10, fail_count=0)
+
+        reset_count = self.db.reset_all_nodes()
+        self.assertEqual(reset_count, 2)
+
+        stats = self.db.get_stats()
+        self.assertEqual(stats["untested"], 2)
+        self.assertEqual(stats["active"], 0)
+        self.assertEqual(stats["dead"], 0)
+
     @patch("requests.Session.post")
     def test_d1_database_query(self, mock_post):
         mock_resp = MagicMock()
